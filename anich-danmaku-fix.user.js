@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.0.0
-// @description  AniCh 专用弹弹 Play 弹幕 userscript，按标题匹配、独立渲染并避免切集串弹幕。
+// @version      2.1.1
+// @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
 // @run-at       document-start
@@ -23,9 +23,23 @@
   const API_CONFIG_KEY = `${STORAGE_PREFIX}apiConfig`;
   const MATCH_CACHE_KEY = `${STORAGE_PREFIX}episodeMatchCache`;
   const PREFERENCE_CACHE_KEY = `${STORAGE_PREFIX}seriesPreferenceCache`;
+  const TOOLBAR_POSITION_KEY = `${STORAGE_PREFIX}toolbarPosition`;
   const STYLE_ID = "anich-ddm-style";
   const DEBUG_NAMESPACE = "__anichDanmaku__";
   const OFFICIAL_API = "https://api.dandanplay.net/api/v2";
+  const MODE_KEYS = Object.freeze(["rtl", "ltr", "top", "bottom"]);
+  const MODE_LABELS = Object.freeze({
+    rtl: "右至左",
+    ltr: "左至右",
+    top: "顶部固定",
+    bottom: "底部固定",
+  });
+  const DEFAULT_BLOCKED_MODES = Object.freeze({
+    rtl: false,
+    ltr: false,
+    top: false,
+    bottom: false,
+  });
   const BUILTIN_PROXIES = [
     "https://danmu-api.misaka10876.top/cors/",
     "https://ddplay-api.7o7o.cc/cors/",
@@ -33,13 +47,17 @@
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     fontSize: 24,
+    displayRegionRatio: 1,
     opacity: 0.9,
     speed: 1,
     offset: 0,
-    panelCollapsed: false,
+    blockedModes: DEFAULT_BLOCKED_MODES,
+    blockedKeywords: [],
+    blockedRegexes: [],
   });
   const SETTING_LIMITS = Object.freeze({
     fontSize: { min: 14, max: 42, step: 1 },
+    displayRegionRatio: { min: 0.2, max: 1, step: 0.05 },
     opacity: { min: 0.2, max: 1, step: 0.05 },
     speed: { min: 0.5, max: 2, step: 0.1 },
     offset: { min: -10, max: 10, step: 0.1 },
@@ -49,10 +67,15 @@
     lastGoodApiBase: "",
     lastGoodProxyPrefix: "",
   });
+  const DEFAULT_TOOLBAR_POSITION = Object.freeze({
+    side: "right",
+    top: 0,
+  });
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
-    opacity: "透明",
+    displayRegionRatio: "区域",
+    opacity: "不透明度",
     speed: "速度",
     offset: "偏移",
   });
@@ -60,13 +83,19 @@
     1: "rtl",
     4: "bottom",
     5: "top",
-    6: "rtl",
+    6: "ltr",
     rtl: "rtl",
+    ltr: "ltr",
     top: "top",
     bottom: "bottom",
   });
+  const TOOLBAR_TARGET_SELECTORS = Object.freeze([
+    "section[player-block]",
+    "section[episode] > section[wrap]",
+    "section[episode]",
+  ]);
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.0";
+  const USER_AGENT = "AniChDanmakuFix/2.1";
   const STOP_WORDS = new Set([
     "第",
     "季",
@@ -147,15 +176,127 @@
     return String(value || "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   }
 
+  function normalizeStringList(values) {
+    const list = Array.isArray(values) ? values : values == null ? [] : [values];
+    return Array.from(new Set(list.map((value) => normalizeSpace(value)).filter(Boolean)));
+  }
+
+  function cloneValue(value) {
+    if (typeof structuredClone === "function") {
+      return structuredClone(value);
+    }
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function normalizeSettings(input) {
+    const next = Object.assign(cloneValue(DEFAULT_SETTINGS), input || {});
+    next.enabled = !!next.enabled;
+    Object.entries(SETTING_LIMITS).forEach(([key, limit]) => {
+      next[key] = clamp(safeNumber(next[key], DEFAULT_SETTINGS[key]), limit.min, limit.max);
+    });
+    next.blockedModes = Object.assign(cloneValue(DEFAULT_BLOCKED_MODES), next.blockedModes || {});
+    MODE_KEYS.forEach((mode) => {
+      next.blockedModes[mode] = !!next.blockedModes[mode];
+    });
+    next.blockedKeywords = normalizeStringList(next.blockedKeywords);
+    next.blockedRegexes = normalizeStringList(next.blockedRegexes);
+    return next;
+  }
+
+  function normalizeToolbarPosition(input) {
+    const next = input && typeof input === "object" ? input : {};
+    return {
+      side: next.side === "left" ? "left" : "right",
+      top: Math.max(0, Math.round(safeNumber(next.top, DEFAULT_TOOLBAR_POSITION.top))),
+    };
+  }
+
+  function parseRegexSource(rawPattern) {
+    const text = normalizeSpace(rawPattern);
+    const match = text.match(/^\/(.+)\/([a-z]*)$/i);
+    if (match) {
+      return {
+        source: match[1],
+        flags: match[2] || "",
+      };
+    }
+    return {
+      source: text,
+      flags: "i",
+    };
+  }
+
+  function compileRegexEntries(patterns) {
+    const valid = [];
+    const invalid = [];
+    normalizeStringList(patterns).forEach((pattern) => {
+      try {
+        const parsed = parseRegexSource(pattern);
+        valid.push({
+          raw: pattern,
+          regex: new RegExp(parsed.source, parsed.flags),
+        });
+      } catch (error) {
+        invalid.push({
+          raw: pattern,
+          message: error?.message || String(error),
+        });
+      }
+    });
+    return { valid, invalid };
+  }
+
+  function applyCommentFilters(comments, settings) {
+    const keywords = normalizeStringList(settings?.blockedKeywords).map((keyword) => keyword.toLowerCase());
+    const compiled = compileRegexEntries(settings?.blockedRegexes);
+    const filtered = (Array.isArray(comments) ? comments : []).filter((comment) => {
+      if (settings?.blockedModes?.[comment.mode]) {
+        return false;
+      }
+      const text = normalizeSpace(comment.text);
+      const lowerText = text.toLowerCase();
+      if (keywords.some((keyword) => lowerText.includes(keyword))) {
+        return false;
+      }
+      for (const entry of compiled.valid) {
+        entry.regex.lastIndex = 0;
+        if (entry.regex.test(text)) {
+          return false;
+        }
+      }
+      return true;
+    });
+    return {
+      comments: filtered,
+      invalidRegexes: compiled.invalid,
+    };
+  }
+
+  function createControlIcon(role) {
+    if (role === "settings") {
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.18 7.18 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.23-1.13.55-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.68 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.8 14.52a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.39 1.05.71 1.63.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.58-.23 1.13-.55 1.63-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z" fill="currentColor"></path>
+        </svg>
+      `;
+    }
+    return `
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M5.5 6A2.5 2.5 0 0 0 3 8.5v5A2.5 2.5 0 0 0 5.5 16H7v3.2a.8.8 0 0 0 1.35.58L12.13 16h6.37A2.5 2.5 0 0 0 21 13.5v-5A2.5 2.5 0 0 0 18.5 6h-13Z" fill="currentColor"></path>
+        <path d="M7.75 9.25h8.5a.75.75 0 0 1 0 1.5h-8.5a.75.75 0 0 1 0-1.5Zm0 3.5h5.5a.75.75 0 0 1 0 1.5h-5.5a.75.75 0 0 1 0-1.5Z" fill="rgba(16, 32, 48, 0.24)"></path>
+      </svg>
+    `;
+  }
+
   function storageGet(key, fallback) {
     try {
       const raw = localStorage.getItem(key);
       if (!raw) {
-        return structuredClone(fallback);
+        return cloneValue(fallback);
       }
-      return Object.assign(structuredClone(fallback), JSON.parse(raw));
+      return Object.assign(cloneValue(fallback), JSON.parse(raw));
     } catch {
-      return structuredClone(fallback);
+      return cloneValue(fallback);
     }
   }
 
@@ -613,10 +754,7 @@
     style.textContent = `
       section[danmaku],
       section[danmaku-input],
-      [danmaku-open],
-      [danmaku-disabled],
-      [tooltip="开启弹幕"],
-      [tooltip="关闭弹幕"] {
+      [danmaku-disabled] {
         display: none !important;
         visibility: hidden !important;
         pointer-events: none !important;
@@ -658,33 +796,123 @@
         pointer-events: none;
       }
 
-      .anich-ddm-panel {
+      .anich-ddm-toolbar {
         position: absolute;
-        top: 12px;
-        right: 12px;
-        width: 268px;
-        color: #eef2f7;
-        background: rgba(13, 18, 28, 0.86);
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        top: 0;
+        right: 0;
+        transform: translate3d(calc(100% + 12px), 0, 0);
+        z-index: 2147483001;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
         border-radius: 14px;
-        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.34);
-        backdrop-filter: blur(12px);
+        background: rgba(11, 16, 24, 0.9);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        box-shadow: 0 14px 32px rgba(0, 0, 0, 0.26);
+        backdrop-filter: blur(14px);
         pointer-events: auto;
-        overflow: hidden;
       }
 
-      .anich-ddm-panel.is-collapsed .anich-ddm-panel-body {
+      .anich-ddm-toolbar.is-dragging {
+        opacity: 0.96;
+      }
+
+      .anich-ddm-toolbar-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 3.4rem;
+        height: 3.4rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.04);
+        color: rgba(244, 249, 255, 0.96);
+        cursor: pointer;
+        transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease, opacity 0.18s ease;
+      }
+
+      .anich-ddm-toolbar-button:hover {
+        transform: translateY(-1px);
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(129, 207, 255, 0.48);
+      }
+
+      .anich-ddm-toolbar-button.is-active {
+        background: linear-gradient(135deg, rgba(152, 228, 255, 0.95), rgba(209, 242, 255, 0.92));
+        border-color: rgba(209, 242, 255, 0.85);
+        color: #102030;
+      }
+
+      .anich-ddm-toolbar-button.is-disabled {
+        opacity: 0.62;
+      }
+
+      .anich-ddm-toolbar-button svg {
+        width: 1.9rem;
+        height: 1.9rem;
+        display: block;
+      }
+
+      .anich-ddm-toolbar-label {
+        font-size: 11px;
+        letter-spacing: 0.02em;
+        color: rgba(226, 235, 244, 0.84);
+        white-space: nowrap;
+        cursor: grab;
+        user-select: none;
+        touch-action: none;
+      }
+
+      .anich-ddm-toolbar.is-dragging .anich-ddm-toolbar-label {
+        cursor: grabbing;
+      }
+
+      .anich-ddm-panel {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        transform: none;
+        z-index: 2147483645;
+        width: min(36rem, calc(100vw - 2rem));
+        max-width: calc(100vw - 2rem);
+        max-height: min(72vh, calc(100vh - 7rem));
+        color: #eef2f7;
+        background: rgba(10, 15, 24, 0.94);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 18px;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.38);
+        backdrop-filter: blur(18px);
+        pointer-events: auto;
+        overflow: hidden;
         display: none;
+      }
+
+      .anich-ddm-panel.is-open {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .anich-ddm-panel-shell {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
       }
 
       .anich-ddm-panel-head {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: space-between;
-        gap: 10px;
-        padding: 10px 12px;
-        cursor: pointer;
+        gap: 12px;
+        padding: 14px 16px 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
         background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+      }
+
+      .anich-ddm-panel-titlebox {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
       }
 
       .anich-ddm-panel-title {
@@ -693,19 +921,89 @@
         letter-spacing: 0.04em;
       }
 
+      .anich-ddm-panel-subtitle {
+        font-size: 11px;
+        opacity: 0.7;
+      }
+
       .anich-ddm-panel-state {
         font-size: 11px;
         opacity: 0.8;
         text-align: right;
+        white-space: pre-line;
       }
 
       .anich-ddm-panel-body {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+
+      .anich-ddm-tabs {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        padding: 12px 16px 0;
+      }
+
+      .anich-ddm-tab {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 999px;
+        color: rgba(232, 240, 247, 0.78);
+        background: rgba(255, 255, 255, 0.04);
+        font: inherit;
+        font-size: 12px;
+        padding: 7px 10px;
+        cursor: pointer;
+        transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+      }
+
+      .anich-ddm-tab.is-active {
+        color: #0d1724;
+        background: linear-gradient(135deg, #9ce3ff, #d0f0ff);
+        border-color: rgba(208, 240, 255, 0.72);
+      }
+
+      .anich-ddm-sections {
+        padding: 12px 16px 16px;
+        overflow: auto;
+      }
+
+      .anich-ddm-section {
+        display: none;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .anich-ddm-section.is-active {
+        display: flex;
+      }
+
+      .anich-ddm-card {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.04);
         padding: 12px;
+      }
+
+      .anich-ddm-card-title {
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 10px;
+        letter-spacing: 0.02em;
+      }
+
+      .anich-ddm-card-note {
+        margin-top: 8px;
+        font-size: 11px;
+        line-height: 1.5;
+        opacity: 0.74;
+        white-space: pre-line;
       }
 
       .anich-ddm-row {
         display: grid;
-        grid-template-columns: 42px 1fr 44px;
+        grid-template-columns: 58px 1fr 54px;
         gap: 8px;
         align-items: center;
         margin-bottom: 8px;
@@ -726,17 +1024,101 @@
         justify-self: start;
       }
 
+      .anich-ddm-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
       .anich-ddm-row-value {
         text-align: right;
         opacity: 0.86;
         font-variant-numeric: tabular-nums;
       }
 
+      .anich-ddm-mode-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .anich-ddm-mode-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .anich-ddm-mode-item input {
+        margin: 0;
+      }
+
+      .anich-ddm-mode-label {
+        font-size: 12px;
+      }
+
+      .anich-ddm-chip-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        min-height: 18px;
+      }
+
+      .anich-ddm-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        border-radius: 999px;
+        padding: 6px 9px;
+        background: rgba(130, 207, 255, 0.13);
+        border: 1px solid rgba(130, 207, 255, 0.24);
+        font-size: 11px;
+      }
+
+      .anich-ddm-chip.is-invalid {
+        background: rgba(255, 116, 129, 0.12);
+        border-color: rgba(255, 116, 129, 0.24);
+      }
+
+      .anich-ddm-chip-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .anich-ddm-chip-remove {
+        border: none;
+        background: transparent;
+        color: inherit;
+        padding: 0;
+        cursor: pointer;
+        font: inherit;
+        opacity: 0.82;
+      }
+
+      .anich-ddm-empty {
+        font-size: 11px;
+        opacity: 0.6;
+      }
+
+      .anich-ddm-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .anich-ddm-editor-title {
+        font-size: 12px;
+        font-weight: 700;
+      }
+
       .anich-ddm-actions {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px;
-        margin-top: 12px;
       }
 
       .anich-ddm-button,
@@ -776,7 +1158,6 @@
       }
 
       .anich-ddm-small {
-        margin-top: 12px;
         font-size: 11px;
         line-height: 1.5;
         white-space: pre-line;
@@ -788,12 +1169,20 @@
         grid-template-columns: 1fr auto;
         gap: 8px;
         align-items: center;
-        margin-top: 10px;
+      }
+
+      .anich-ddm-error {
+        margin-top: 4px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #ffb6bd;
+        white-space: pre-line;
       }
 
       .anich-ddm-matcher {
         position: absolute;
         inset: 18px auto auto 18px;
+        z-index: 2147483644;
         width: min(460px, calc(100% - 36px));
         max-height: calc(100% - 36px);
         overflow: hidden;
@@ -889,14 +1278,16 @@
       }
 
       @keyframes anich-ddm-scroll {
-        from { transform: translate3d(var(--ddm-start-x), 0, 0); opacity: 1; }
-        to { transform: translate3d(var(--ddm-end-x), 0, 0); opacity: 1; }
+        0% { transform: translate3d(var(--ddm-start-x), 0, 0); opacity: 0; }
+        10% { opacity: var(--ddm-opacity, 1); }
+        90% { opacity: var(--ddm-opacity, 1); }
+        100% { transform: translate3d(var(--ddm-end-x), 0, 0); opacity: 0; }
       }
 
       @keyframes anich-ddm-still {
         0% { opacity: 0; }
-        8% { opacity: 1; }
-        90% { opacity: 1; }
+        8% { opacity: var(--ddm-opacity, 1); }
+        90% { opacity: var(--ddm-opacity, 1); }
         100% { opacity: 0; }
       }
     `;
@@ -1087,6 +1478,8 @@
       this.ids = new Set();
       this.stats = {
         count: 0,
+        visibleCount: 0,
+        filteredCount: 0,
         source: "",
         episodeId: null,
       };
@@ -1105,9 +1498,17 @@
       this.items.sort((left, right) => left.time - right.time);
       this.stats = {
         count: this.items.length,
+        visibleCount: this.items.length,
+        filteredCount: 0,
         source: sourceName || "",
         episodeId: match?.episodeId || null,
       };
+    }
+
+    setVisibilityStats(visibleCount) {
+      const nextVisible = Math.max(0, Math.min(this.items.length, safeNumber(visibleCount, this.items.length)));
+      this.stats.visibleCount = nextVisible;
+      this.stats.filteredCount = Math.max(0, this.items.length - nextVisible);
     }
   }
 
@@ -1122,6 +1523,7 @@
       this.width = 0;
       this.height = 0;
       this.rtlLanes = [];
+      this.ltrLanes = [];
       this.topLanes = [];
       this.bottomLanes = [];
       this.paused = false;
@@ -1195,10 +1597,13 @@
 
     resetLanes() {
       const rowHeight = Math.max(24, this.session.settings.fontSize + 8);
-      const laneCount = Math.max(1, Math.floor((this.height || 320) / rowHeight));
-      this.rtlLanes = Array.from({ length: laneCount }, () => ({ freeAt: 0, top: 0 }));
-      this.topLanes = Array.from({ length: Math.max(1, Math.floor(laneCount / 2)) }, () => ({ freeAt: 0, top: 0 }));
-      this.bottomLanes = Array.from({ length: Math.max(1, Math.floor(laneCount / 2)) }, () => ({ freeAt: 0, top: 0 }));
+      const fullLaneCount = Math.max(1, Math.floor((this.height || 320) / rowHeight));
+      const regionHeight = Math.max(rowHeight, Math.floor((this.height || 320) * this.session.settings.displayRegionRatio));
+      const scrollLaneCount = Math.max(1, Math.floor(regionHeight / rowHeight));
+      this.rtlLanes = Array.from({ length: scrollLaneCount }, () => ({ freeAt: 0, top: 0 }));
+      this.ltrLanes = Array.from({ length: scrollLaneCount }, () => ({ freeAt: 0, top: 0 }));
+      this.topLanes = Array.from({ length: Math.max(1, Math.floor(fullLaneCount / 2)) }, () => ({ freeAt: 0, top: 0 }));
+      this.bottomLanes = Array.from({ length: Math.max(1, Math.floor(fullLaneCount / 2)) }, () => ({ freeAt: 0, top: 0 }));
     }
 
     clear() {
@@ -1228,7 +1633,7 @@
       const node = createElement("div", "anich-ddm-item");
       node.textContent = comment.text;
       node.style.fontSize = `${settings.fontSize}px`;
-      node.style.opacity = String(settings.opacity);
+      node.style.setProperty("--ddm-opacity", String(settings.opacity));
       node.style.color = comment.color || "#ffffff";
       this.measureNode.style.fontSize = node.style.fontSize;
       this.measureNode.style.fontWeight = "700";
@@ -1246,14 +1651,19 @@
         node.style.left = `${Math.max(0, (this.width - commentWidth) / 2)}px`;
         node.style.animation = `anich-ddm-still ${duration}ms linear forwards`;
       } else {
-        const lane = this.pickScrollLane(now, rowHeight, commentWidth);
+        const lane = this.pickScrollLane(comment.mode, now, rowHeight, commentWidth);
         const pixelsPerSecond = 140 * settings.speed;
         const duration = Math.round(((this.width + commentWidth) / pixelsPerSecond) * 1000);
         const top = lane.top;
         lane.freeAt = now + Math.min(duration * 0.75, (commentWidth / pixelsPerSecond) * 1000 + 450);
         node.style.top = `${top}px`;
-        node.style.setProperty("--ddm-start-x", `${this.width}px`);
-        node.style.setProperty("--ddm-end-x", `${-commentWidth}px`);
+        if (comment.mode === "ltr") {
+          node.style.setProperty("--ddm-start-x", `${-commentWidth}px`);
+          node.style.setProperty("--ddm-end-x", `${this.width}px`);
+        } else {
+          node.style.setProperty("--ddm-start-x", `${this.width}px`);
+          node.style.setProperty("--ddm-end-x", `${-commentWidth}px`);
+        }
         node.style.animation = `anich-ddm-scroll ${duration}ms linear forwards`;
       }
 
@@ -1267,20 +1677,22 @@
       this.layer.appendChild(node);
     }
 
-    pickScrollLane(now, rowHeight) {
-      let bestLane = this.rtlLanes[0];
+    pickScrollLane(mode, now, rowHeight) {
+      const lanes = mode === "ltr" ? this.ltrLanes : this.rtlLanes;
+      let bestLane = lanes[0];
       let bestIndex = 0;
-      this.rtlLanes.forEach((lane, index) => {
+      for (let index = 0; index < lanes.length; index += 1) {
+        const lane = lanes[index];
         if (lane.freeAt <= now) {
           bestLane = lane;
           bestIndex = index;
-          return;
+          break;
         }
         if (lane.freeAt < bestLane.freeAt) {
           bestLane = lane;
           bestIndex = index;
         }
-      });
+      }
       bestLane.top = bestIndex * rowHeight;
       return bestLane;
     }
@@ -1289,17 +1701,18 @@
       const lanes = mode === "top" ? this.topLanes : this.bottomLanes;
       let bestLane = lanes[0];
       let bestIndex = 0;
-      lanes.forEach((lane, index) => {
+      for (let index = 0; index < lanes.length; index += 1) {
+        const lane = lanes[index];
         if (lane.freeAt <= now) {
           bestLane = lane;
           bestIndex = index;
-          return;
+          break;
         }
         if (lane.freeAt < bestLane.freeAt) {
           bestLane = lane;
           bestIndex = index;
         }
-      });
+      }
       bestLane.top =
         mode === "top"
           ? bestIndex * rowHeight
@@ -1418,10 +1831,29 @@
   class ControlPanel {
     constructor(session) {
       this.session = session;
+      this.playerContainer = null;
+      this.overlay = null;
+      this.toolbarHost = null;
+      this.toolbar = null;
+      this.toolbarHandle = null;
       this.panel = null;
+      this.panelSubtitle = null;
       this.panelState = null;
-      this.stats = null;
+      this.summaryStats = null;
+      this.matchStats = null;
       this.rowValues = {};
+      this.rangeInputs = {};
+      this.modeInputs = {};
+      this.sections = {};
+      this.tabs = {};
+      this.activeTab = "basic";
+      this.enabledInput = null;
+      this.keywordInput = null;
+      this.keywordList = null;
+      this.regexInput = null;
+      this.regexList = null;
+      this.regexErrors = null;
+      this.apiInput = null;
       this.matcher = null;
       this.searchInput = null;
       this.searchButton = null;
@@ -1431,36 +1863,309 @@
       this.confirmButton = null;
       this.selectedResult = null;
       this.currentResults = [];
+      this.settingsEntry = null;
+      this.toggleEntry = null;
+      this.hostInlineStyles = null;
+      this.toolbarPosition = normalizeToolbarPosition(storageGet(TOOLBAR_POSITION_KEY, DEFAULT_TOOLBAR_POSITION));
+      this.dragState = null;
+      this.handleDocumentPointerDown = this.handleDocumentPointerDown.bind(this);
+      this.handleToolbarClick = this.handleToolbarClick.bind(this);
+      this.handleToolbarPointerDown = this.handleToolbarPointerDown.bind(this);
+      this.handleToolbarPointerMove = this.handleToolbarPointerMove.bind(this);
+      this.handleToolbarPointerUp = this.handleToolbarPointerUp.bind(this);
+      this.handleViewportChange = this.handleViewportChange.bind(this);
+      window.addEventListener("resize", this.handleViewportChange, true);
     }
 
-    attach(overlay) {
-      if (!overlay) {
+    attach(playerContainer, overlay) {
+      if (!playerContainer || !overlay) {
         return;
       }
-      if (this.panel?.isConnected && this.panel.parentElement === overlay) {
+
+      const panelWasOpen = !!this.panel?.classList.contains("is-open");
+      const matcherWasOpen = !!this.matcher?.classList.contains("is-open");
+      this.playerContainer = playerContainer;
+      this.overlay = overlay;
+      const nextToolbarHost = this.resolveToolbarHost(playerContainer);
+      if (nextToolbarHost && nextToolbarHost !== this.toolbarHost) {
+        this.releaseToolbarHost();
+        this.toolbarHost = nextToolbarHost;
+        this.prepareToolbarHost(nextToolbarHost);
+      }
+      if (!this.toolbarHost) {
         return;
       }
+      if (!this.toolbar?.isConnected || this.toolbar.parentElement !== this.toolbarHost) {
+        if (this.toolbar?.isConnected) {
+          this.toolbar.remove();
+        }
+        this.buildToolbar(this.toolbarHost);
+      }
+      if (!this.panel?.isConnected || this.panel.parentElement !== this.toolbarHost) {
+        if (this.panel?.isConnected) {
+          this.panel.remove();
+        }
+        this.buildPanel(this.toolbarHost);
+        if (panelWasOpen) {
+          this.panel.classList.add("is-open");
+        }
+      }
+      if (!this.matcher?.isConnected || this.matcher.parentElement !== overlay) {
+        if (this.matcher?.isConnected) {
+          this.matcher.remove();
+        }
+        this.buildMatcher(overlay);
+        if (matcherWasOpen) {
+          this.matcher.classList.add("is-open");
+        }
+      }
+      this.applyToolbarPosition(true);
+      this.update();
+    }
+
+    destroy() {
+      document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
+      window.removeEventListener("resize", this.handleViewportChange, true);
+      this.stopToolbarDrag(false);
+      if (this.toolbar?.isConnected) {
+        this.toolbar.remove();
+      }
+      this.toolbar = null;
+      this.toolbarHandle = null;
+      this.settingsEntry = null;
+      this.toggleEntry = null;
       if (this.panel?.isConnected) {
         this.panel.remove();
       }
       if (this.matcher?.isConnected) {
         this.matcher.remove();
       }
+      this.releaseToolbarHost();
+      this.playerContainer = null;
+      this.overlay = null;
+      this.panel = null;
+      this.matcher = null;
+    }
 
+    resolveToolbarHost(playerContainer) {
+      const fullscreenElement = document.fullscreenElement;
+      if (
+        fullscreenElement instanceof Element &&
+        (fullscreenElement.contains(playerContainer) || playerContainer.contains(fullscreenElement))
+      ) {
+        return fullscreenElement;
+      }
+      const selectorList = TOOLBAR_TARGET_SELECTORS.join(", ");
+      if (playerContainer instanceof Element) {
+        const ancestorMatch = playerContainer.closest(selectorList);
+        if (ancestorMatch) {
+          return ancestorMatch;
+        }
+      }
+      const scopedRoot = playerContainer?.closest("section[episode]") || document;
+      for (const selector of TOOLBAR_TARGET_SELECTORS) {
+        const scopedMatch = scopedRoot.querySelector(selector);
+        if (scopedMatch) {
+          return scopedMatch;
+        }
+      }
+      return playerContainer.parentElement || playerContainer;
+    }
+
+    prepareToolbarHost(host) {
+      if (!(host instanceof HTMLElement)) {
+        return;
+      }
+      this.hostInlineStyles = {
+        position: host.style.position,
+        overflow: host.style.overflow,
+        overflowX: host.style.overflowX,
+        overflowY: host.style.overflowY,
+      };
+      const computed = window.getComputedStyle(host);
+      if (computed.position === "static") {
+        host.style.position = "relative";
+      }
+      if (
+        computed.overflow === "hidden" ||
+        computed.overflow === "clip" ||
+        computed.overflowX === "hidden" ||
+        computed.overflowX === "clip" ||
+        computed.overflowY === "hidden" ||
+        computed.overflowY === "clip"
+      ) {
+        host.style.overflow = "visible";
+        host.style.overflowX = "visible";
+        host.style.overflowY = "visible";
+      }
+    }
+
+    releaseToolbarHost() {
+      if (this.toolbarHost instanceof HTMLElement && this.hostInlineStyles) {
+        this.toolbarHost.style.position = this.hostInlineStyles.position;
+        this.toolbarHost.style.overflow = this.hostInlineStyles.overflow;
+        this.toolbarHost.style.overflowX = this.hostInlineStyles.overflowX;
+        this.toolbarHost.style.overflowY = this.hostInlineStyles.overflowY;
+      }
+      this.hostInlineStyles = null;
+      this.toolbarHost = null;
+    }
+
+    saveToolbarPosition() {
+      storageSet(TOOLBAR_POSITION_KEY, this.toolbarPosition);
+    }
+
+    getResolvedToolbarPosition() {
+      const position = normalizeToolbarPosition(this.toolbarPosition);
+      const hostHeight = this.toolbarHost?.clientHeight || this.toolbarHost?.getBoundingClientRect?.().height || 0;
+      const toolbarHeight = this.toolbar?.offsetHeight || 54;
+      const maxTop = Math.max(0, Math.round(hostHeight - toolbarHeight));
+      return {
+        side: position.side,
+        top: clamp(position.top, 0, maxTop),
+        toolbarHeight,
+      };
+    }
+
+    applyToolbarPosition(persist = false) {
+      if (!this.toolbar) {
+        return;
+      }
+      const next = this.getResolvedToolbarPosition();
+      const changed = next.side !== this.toolbarPosition.side || next.top !== this.toolbarPosition.top;
+      this.toolbarPosition = {
+        side: next.side,
+        top: next.top,
+      };
+      this.toolbar.style.top = `${next.top}px`;
+      if (next.side === "left") {
+        this.toolbar.style.left = "0";
+        this.toolbar.style.right = "auto";
+        this.toolbar.style.transform = "translate3d(calc(-100% - 12px), 0, 0)";
+      } else {
+        this.toolbar.style.left = "auto";
+        this.toolbar.style.right = "0";
+        this.toolbar.style.transform = "translate3d(calc(100% + 12px), 0, 0)";
+      }
+      this.applyPanelPosition();
+      if (persist && changed) {
+        this.saveToolbarPosition();
+      }
+    }
+
+    applyPanelPosition() {
+      if (!this.panel || !this.toolbar) {
+        return;
+      }
+      const toolbarRect = this.toolbar.getBoundingClientRect();
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1280;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 720;
+      const margin = 16;
+      const gap = 12;
+      const panelWidth = Math.max(0, Math.min(576, viewportWidth - margin * 2));
+      this.panel.style.width = `${panelWidth}px`;
+
+      const panelRect = this.panel.getBoundingClientRect();
+      const effectivePanelWidth = Math.min(panelWidth, panelRect.width || panelWidth);
+      const effectivePanelHeight = Math.min(panelRect.height || 0, Math.max(0, viewportHeight - margin * 2));
+      const preferredSide = this.toolbarPosition.side === "left" ? "left" : "right";
+      const availableLeft = toolbarRect.left - gap - margin;
+      const availableRight = viewportWidth - margin - (toolbarRect.right + gap);
+      let placeSide = preferredSide;
+
+      if (preferredSide === "right") {
+        if (availableRight < effectivePanelWidth && availableLeft >= effectivePanelWidth) {
+          placeSide = "left";
+        }
+      } else if (availableLeft < effectivePanelWidth && availableRight >= effectivePanelWidth) {
+        placeSide = "right";
+      }
+
+      const desiredLeft =
+        placeSide === "right" ? toolbarRect.right + gap : toolbarRect.left - gap - effectivePanelWidth;
+      const maxLeft = Math.max(margin, viewportWidth - margin - effectivePanelWidth);
+      const clampedLeft = clamp(Math.round(desiredLeft), margin, maxLeft);
+
+      const desiredTop = toolbarRect.top + toolbarRect.height + gap;
+      const maxTop = Math.max(margin, viewportHeight - margin - effectivePanelHeight);
+      const clampedTop = clamp(Math.round(desiredTop), margin, maxTop);
+
+      this.panel.style.left = `${clampedLeft}px`;
+      this.panel.style.top = `${clampedTop}px`;
+    }
+
+    buildToolbar(parent) {
+      this.toolbar = createElement("div", "anich-ddm-toolbar");
+      this.toolbar.dataset.anichDdmToolbar = "true";
+      const label = createElement("div", "anich-ddm-toolbar-label", "弹幕");
+      label.title = "按住拖动工具条";
+      label.addEventListener("pointerdown", this.handleToolbarPointerDown);
+      const toggleButton = createElement("button", "anich-ddm-toolbar-button");
+      toggleButton.type = "button";
+      toggleButton.dataset.anichDdmRole = "toggle";
+      toggleButton.innerHTML = createControlIcon("toggle");
+      toggleButton.setAttribute("aria-label", "弹幕开关");
+      toggleButton.addEventListener("click", this.handleToolbarClick);
+
+      const settingsButton = createElement("button", "anich-ddm-toolbar-button");
+      settingsButton.type = "button";
+      settingsButton.dataset.anichDdmRole = "settings";
+      settingsButton.innerHTML = createControlIcon("settings");
+      settingsButton.setAttribute("aria-label", "弹幕设置");
+      settingsButton.addEventListener("click", this.handleToolbarClick);
+
+      this.toolbarHandle = label;
+      this.settingsEntry = settingsButton;
+      this.toggleEntry = toggleButton;
+      this.toolbar.append(label, toggleButton, settingsButton);
+      parent.appendChild(this.toolbar);
+    }
+
+    buildPanel(parent) {
       this.panel = createElement("div", "anich-ddm-panel");
-      this.panel.classList.toggle("is-collapsed", this.session.settings.panelCollapsed);
-      const head = createElement("button", "anich-ddm-panel-head");
-      head.type = "button";
+      const shell = createElement("div", "anich-ddm-panel-shell");
+      const head = createElement("div", "anich-ddm-panel-head");
+      const titleBox = createElement("div", "anich-ddm-panel-titlebox");
       const title = createElement("div", "anich-ddm-panel-title", TOP_BAR_TITLE);
+      this.panelSubtitle = createElement("div", "anich-ddm-panel-subtitle", "外置工具条入口");
       this.panelState = createElement("div", "anich-ddm-panel-state");
-      head.append(title, this.panelState);
-      head.addEventListener("click", () => {
-        this.session.settings.panelCollapsed = !this.session.settings.panelCollapsed;
-        this.session.saveSettings();
-        this.panel.classList.toggle("is-collapsed", this.session.settings.panelCollapsed);
-      });
+      titleBox.append(title, this.panelSubtitle);
+      const closeButton = createElement("button", "anich-ddm-button", "关闭");
+      closeButton.type = "button";
+      closeButton.addEventListener("click", () => this.closePanel());
+      head.append(titleBox, this.panelState, closeButton);
 
       const body = createElement("div", "anich-ddm-panel-body");
+      const tabs = createElement("div", "anich-ddm-tabs");
+      [
+        { key: "basic", label: "基础" },
+        { key: "filters", label: "过滤" },
+        { key: "match", label: "匹配/来源" },
+      ].forEach((tab) => {
+        const button = createElement("button", "anich-ddm-tab", tab.label);
+        button.type = "button";
+        button.addEventListener("click", () => this.switchTab(tab.key));
+        this.tabs[tab.key] = button;
+        tabs.appendChild(button);
+      });
+      const sections = createElement("div", "anich-ddm-sections");
+      this.buildBasicSection(sections);
+      this.buildFilterSection(sections);
+      this.buildMatchSection(sections);
+      body.append(tabs, sections);
+
+      shell.append(head, body);
+      this.panel.appendChild(shell);
+      parent.appendChild(this.panel);
+      document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
+      document.addEventListener("pointerdown", this.handleDocumentPointerDown, true);
+      this.switchTab(this.activeTab);
+    }
+
+    buildBasicSection(parent) {
+      const section = createElement("div", "anich-ddm-section");
+      const settingsCard = createElement("div", "anich-ddm-card");
+      settingsCard.appendChild(createElement("div", "anich-ddm-card-title", "基础设置"));
       Object.entries(PANEL_LABELS).forEach(([key, label]) => {
         const row = createElement("label", "anich-ddm-row");
         const labelNode = createElement("span", "", label);
@@ -1473,7 +2178,10 @@
           checkbox.addEventListener("change", () => {
             this.session.updateSetting(key, checkbox.checked);
           });
-          row.append(labelNode, checkbox, valueNode);
+          this.enabledInput = checkbox;
+          const wrapper = createElement("span", "anich-ddm-switch");
+          wrapper.appendChild(checkbox);
+          row.append(labelNode, wrapper, valueNode);
         } else {
           const range = document.createElement("input");
           range.type = "range";
@@ -1484,32 +2192,86 @@
           range.addEventListener("input", () => {
             this.session.updateSetting(key, safeNumber(range.value, this.session.settings[key]));
           });
+          this.rangeInputs[key] = range;
           row.append(labelNode, range, valueNode);
         }
-        body.appendChild(row);
+        settingsCard.appendChild(row);
       });
+      const summaryCard = createElement("div", "anich-ddm-card");
+      summaryCard.appendChild(createElement("div", "anich-ddm-card-title", "运行概览"));
+      this.summaryStats = createElement("div", "anich-ddm-small");
+      summaryCard.appendChild(this.summaryStats);
+      section.append(settingsCard, summaryCard);
+      this.sections.basic = section;
+      parent.appendChild(section);
+    }
 
-      const apiBox = createElement("div", "anich-ddm-small");
+    buildFilterSection(parent) {
+      const section = createElement("div", "anich-ddm-section");
+
+      const modeCard = createElement("div", "anich-ddm-card");
+      modeCard.appendChild(createElement("div", "anich-ddm-card-title", "显示类型"));
+      const modeGrid = createElement("div", "anich-ddm-mode-grid");
+      MODE_KEYS.forEach((mode) => {
+        const item = createElement("label", "anich-ddm-mode-item");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = !this.session.settings.blockedModes[mode];
+        input.addEventListener("change", () => {
+          this.session.setBlockedMode(mode, !input.checked);
+        });
+        this.modeInputs[mode] = input;
+        item.append(input, createElement("span", "anich-ddm-mode-label", MODE_LABELS[mode]));
+        modeGrid.appendChild(item);
+      });
+      modeCard.appendChild(modeGrid);
+      modeCard.appendChild(createElement("div", "anich-ddm-card-note", "勾选表示显示该类型弹幕，取消勾选表示屏蔽。"));
+
+      const keywordCard = this.buildEditorCard("blockedKeywords", "关键词屏蔽", "输入关键词后添加");
+      const regexCard = this.buildEditorCard("blockedRegexes", "正则屏蔽", "支持 /pattern/flags 或普通表达式");
+      this.regexErrors = createElement("div", "anich-ddm-error");
+      regexCard.appendChild(this.regexErrors);
+
+      section.append(modeCard, keywordCard, regexCard);
+      this.sections.filters = section;
+      parent.appendChild(section);
+    }
+
+    buildEditorCard(key, title, placeholder) {
+      const card = createElement("div", "anich-ddm-card");
+      const editor = createElement("div", "anich-ddm-editor");
+      editor.appendChild(createElement("div", "anich-ddm-editor-title", title));
       const inline = createElement("div", "anich-ddm-inline");
-      const apiInput = createElement("input", "anich-ddm-input");
-      apiInput.placeholder = "自定义 API 前缀，例如 https://xxx/api/v2";
-      apiInput.value = this.session.transport.getConfig().customApiPrefix || "";
-      apiInput.addEventListener("change", () => {
-        this.session.transport.saveConfig({ customApiPrefix: apiInput.value.trim() });
-        this.session.setStatus("已保存自定义 API 前缀");
-        this.update();
+      const input = createElement("input", "anich-ddm-input");
+      input.placeholder = placeholder;
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          this.handleAddListEntry(key, input);
+        }
       });
-      const apiSaveButton = createElement("button", "anich-ddm-button", "保存");
-      apiSaveButton.type = "button";
-      apiSaveButton.addEventListener("click", () => {
-        this.session.transport.saveConfig({ customApiPrefix: apiInput.value.trim() });
-        this.session.setStatus("已保存自定义 API 前缀");
-        this.update();
-      });
-      inline.append(apiInput, apiSaveButton);
-      body.appendChild(inline);
-      body.appendChild(apiBox);
+      const addButton = createElement("button", "anich-ddm-button", "添加");
+      addButton.type = "button";
+      addButton.addEventListener("click", () => this.handleAddListEntry(key, input));
+      inline.append(input, addButton);
+      const list = createElement("div", "anich-ddm-chip-list");
+      editor.append(inline, list);
+      card.appendChild(editor);
+      if (key === "blockedKeywords") {
+        this.keywordInput = input;
+        this.keywordList = list;
+      } else {
+        this.regexInput = input;
+        this.regexList = list;
+      }
+      return card;
+    }
 
+    buildMatchSection(parent) {
+      const section = createElement("div", "anich-ddm-section");
+
+      const actionCard = createElement("div", "anich-ddm-card");
+      actionCard.appendChild(createElement("div", "anich-ddm-card-title", "匹配操作"));
       const actions = createElement("div", "anich-ddm-actions");
       const matcherButton = createElement("button", "anich-ddm-button", "手动匹配");
       matcherButton.type = "button";
@@ -1531,15 +2293,33 @@
         this.session.renderer.clear();
       });
       actions.append(matcherButton, rematchButton, clearButton, clearDmButton);
-      body.appendChild(actions);
+      actionCard.appendChild(actions);
 
-      this.stats = createElement("div", "anich-ddm-small");
-      body.appendChild(this.stats);
+      const sourceCard = createElement("div", "anich-ddm-card");
+      sourceCard.appendChild(createElement("div", "anich-ddm-card-title", "来源与 API"));
+      const inline = createElement("div", "anich-ddm-inline");
+      this.apiInput = createElement("input", "anich-ddm-input");
+      this.apiInput.placeholder = "自定义 API 前缀，例如 https://xxx/api/v2";
+      this.apiInput.value = this.session.transport.getConfig().customApiPrefix || "";
+      const apiSaveButton = createElement("button", "anich-ddm-button", "保存");
+      apiSaveButton.type = "button";
+      apiSaveButton.addEventListener("click", () => {
+        this.session.transport.saveConfig({ customApiPrefix: this.apiInput.value.trim() });
+        this.session.setStatus("已保存自定义 API 前缀");
+        this.update();
+      });
+      inline.append(this.apiInput, apiSaveButton);
+      sourceCard.appendChild(inline);
+      sourceCard.appendChild(createElement("div", "anich-ddm-card-note", "外置工具条是唯一入口，AniCh 原生控件保持站点默认行为。"));
 
-      this.panel.append(head, body);
-      overlay.appendChild(this.panel);
-      this.buildMatcher(overlay);
-      this.update();
+      const statusCard = createElement("div", "anich-ddm-card");
+      statusCard.appendChild(createElement("div", "anich-ddm-card-title", "状态"));
+      this.matchStats = createElement("div", "anich-ddm-small");
+      statusCard.appendChild(this.matchStats);
+
+      section.append(actionCard, sourceCard, statusCard);
+      this.sections.match = section;
+      parent.appendChild(section);
     }
 
     buildMatcher(overlay) {
@@ -1598,6 +2378,184 @@
 
       this.matcher.append(head, body);
       overlay.appendChild(this.matcher);
+    }
+
+    switchTab(tabKey) {
+      this.activeTab = this.sections[tabKey] ? tabKey : "basic";
+      Object.entries(this.tabs).forEach(([key, button]) => {
+        button.classList.toggle("is-active", key === this.activeTab);
+      });
+      Object.entries(this.sections).forEach(([key, section]) => {
+        section.classList.toggle("is-active", key === this.activeTab);
+      });
+    }
+
+    openPanel() {
+      if (!this.panel) {
+        return;
+      }
+      this.panel.classList.add("is-open");
+      this.applyPanelPosition();
+      this.syncControlStates();
+    }
+
+    closePanel() {
+      this.panel?.classList.remove("is-open");
+      this.syncControlStates();
+    }
+
+    togglePanel() {
+      if (!this.panel) {
+        return;
+      }
+      if (this.panel.classList.contains("is-open")) {
+        this.closePanel();
+      } else {
+        this.openPanel();
+      }
+    }
+
+    handleDocumentPointerDown(event) {
+      const target = event.target;
+      if (this.panel?.contains(target) || this.matcher?.contains(target) || this.toolbar?.contains(target)) {
+        return;
+      }
+      this.closePanel();
+    }
+
+    handleToolbarClick(event) {
+      const role = event.currentTarget?.dataset?.anichDdmRole;
+      event.preventDefault();
+      event.stopPropagation();
+      if (role === "settings") {
+        this.togglePanel();
+        return;
+      }
+      if (role === "toggle") {
+        this.session.updateSetting("enabled", !this.session.settings.enabled);
+      }
+    }
+
+    handleToolbarPointerDown(event) {
+      if (event.button !== 0 || !this.toolbarHost || !this.toolbar) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const resolved = this.getResolvedToolbarPosition();
+      this.dragState = {
+        pointerId: event.pointerId,
+        startY: event.clientY,
+        startTop: resolved.top,
+      };
+      this.toolbar.classList.add("is-dragging");
+      if (this.toolbarHandle?.setPointerCapture) {
+        this.toolbarHandle.setPointerCapture(event.pointerId);
+      }
+      window.addEventListener("pointermove", this.handleToolbarPointerMove, true);
+      window.addEventListener("pointerup", this.handleToolbarPointerUp, true);
+      window.addEventListener("pointercancel", this.handleToolbarPointerUp, true);
+    }
+
+    handleToolbarPointerMove(event) {
+      if (!this.dragState || event.pointerId !== this.dragState.pointerId || !this.toolbarHost) {
+        return;
+      }
+      const hostRect = this.toolbarHost.getBoundingClientRect();
+      const toolbarHeight = this.toolbar?.offsetHeight || 54;
+      const maxTop = Math.max(0, Math.round(hostRect.height - toolbarHeight));
+      const nextTop = clamp(Math.round(this.dragState.startTop + (event.clientY - this.dragState.startY)), 0, maxTop);
+      const nextSide = event.clientX < hostRect.left + hostRect.width / 2 ? "left" : "right";
+      this.toolbarPosition = {
+        side: nextSide,
+        top: nextTop,
+      };
+      this.applyToolbarPosition(false);
+    }
+
+    handleToolbarPointerUp(event) {
+      if (!this.dragState || event.pointerId !== this.dragState.pointerId) {
+        return;
+      }
+      this.stopToolbarDrag(true);
+    }
+
+    stopToolbarDrag(persist) {
+      if (!this.dragState) {
+        return;
+      }
+      const pointerId = this.dragState.pointerId;
+      this.dragState = null;
+      this.toolbar?.classList.remove("is-dragging");
+      if (this.toolbarHandle?.releasePointerCapture) {
+        try {
+          this.toolbarHandle.releasePointerCapture(pointerId);
+        } catch {}
+      }
+      window.removeEventListener("pointermove", this.handleToolbarPointerMove, true);
+      window.removeEventListener("pointerup", this.handleToolbarPointerUp, true);
+      window.removeEventListener("pointercancel", this.handleToolbarPointerUp, true);
+      this.applyToolbarPosition(!!persist);
+    }
+
+    handleViewportChange() {
+      this.applyToolbarPosition(true);
+    }
+
+    syncControlStates() {
+      const isOpen = !!this.panel?.classList.contains("is-open");
+      const enabled = !!this.session.settings.enabled;
+      if (this.settingsEntry) {
+        this.settingsEntry.classList.toggle("is-active", isOpen);
+        this.settingsEntry.classList.remove("is-disabled");
+        this.settingsEntry.setAttribute("aria-pressed", isOpen ? "true" : "false");
+        this.settingsEntry.title = isOpen ? "关闭弹幕设置" : "打开弹幕设置";
+      }
+      if (this.toggleEntry) {
+        this.toggleEntry.classList.toggle("is-active", enabled);
+        this.toggleEntry.classList.toggle("is-disabled", !enabled);
+        this.toggleEntry.setAttribute("aria-pressed", enabled ? "true" : "false");
+        this.toggleEntry.title = enabled ? "关闭弹幕" : "开启弹幕";
+      }
+    }
+
+    handleAddListEntry(key, input) {
+      const value = normalizeSpace(input.value);
+      if (!value) {
+        return;
+      }
+      this.session.updateSetting(key, [...this.session.settings[key], value]);
+      input.value = "";
+    }
+
+    renderTokenList(key, listNode, invalidEntries = []) {
+      if (!listNode) {
+        return;
+      }
+      listNode.textContent = "";
+      const values = this.session.settings[key];
+      if (!values.length) {
+        listNode.appendChild(createElement("div", "anich-ddm-empty", "暂无规则"));
+        return;
+      }
+      const invalidMap = new Map(invalidEntries.map((entry) => [entry.raw, entry.message]));
+      values.forEach((value) => {
+        const chip = createElement("div", "anich-ddm-chip");
+        if (invalidMap.has(value)) {
+          chip.classList.add("is-invalid");
+        }
+        chip.appendChild(createElement("span", "anich-ddm-chip-text", value));
+        const removeButton = createElement("button", "anich-ddm-chip-remove", "移除");
+        removeButton.type = "button";
+        removeButton.addEventListener("click", () => {
+          this.session.updateSetting(
+            key,
+            this.session.settings[key].filter((entry) => entry !== value)
+          );
+        });
+        chip.appendChild(removeButton);
+        listNode.appendChild(chip);
+      });
     }
 
     openMatcher() {
@@ -1727,34 +2685,71 @@
     }
 
     update() {
-      if (!this.panelState || !this.stats) {
+      if (!this.panelState) {
         return;
       }
       const session = this.session;
       const match = session.currentMatch;
-      this.panelState.textContent = [session.statusLabel, match ? "已匹配" : "未匹配"].join("\n");
-      this.rowValues.enabled.textContent = session.settings.enabled ? "开" : "关";
-      this.rowValues.fontSize.textContent = `${session.settings.fontSize}px`;
-      this.rowValues.opacity.textContent = `${Math.round(session.settings.opacity * 100)}%`;
-      this.rowValues.speed.textContent = `${session.settings.speed.toFixed(1)}x`;
+      const settings = session.settings;
+      if (this.panelSubtitle) {
+        this.panelSubtitle.textContent = "外置工具条入口";
+      }
+      this.panelState.textContent = [session.statusLabel, match ? "已匹配" : "待匹配"].join("\n");
+      if (this.enabledInput) {
+        this.enabledInput.checked = settings.enabled;
+      }
+      Object.entries(this.rangeInputs).forEach(([key, input]) => {
+        input.value = String(settings[key]);
+      });
+      this.rowValues.enabled.textContent = settings.enabled ? "开" : "关";
+      this.rowValues.fontSize.textContent = `${settings.fontSize}px`;
+      this.rowValues.displayRegionRatio.textContent = `${Math.round(settings.displayRegionRatio * 100)}%`;
+      this.rowValues.opacity.textContent = `${Math.round(settings.opacity * 100)}%`;
+      this.rowValues.speed.textContent = `${settings.speed.toFixed(1)}x`;
       this.rowValues.offset.textContent =
         session.settings.offset === 0
           ? "0.0s"
           : `${session.settings.offset > 0 ? "+" : ""}${session.settings.offset.toFixed(1)}s`;
+      MODE_KEYS.forEach((mode) => {
+        if (this.modeInputs[mode]) {
+          this.modeInputs[mode].checked = !settings.blockedModes[mode];
+        }
+      });
+      if (this.apiInput) {
+        this.apiInput.value = session.transport.getConfig().customApiPrefix || "";
+      }
+      this.renderTokenList("blockedKeywords", this.keywordList);
+      this.renderTokenList("blockedRegexes", this.regexList, session.invalidRegexes || []);
+      this.regexErrors.textContent = (session.invalidRegexes || []).length
+        ? `失效正则已跳过:\n${session.invalidRegexes
+            .map((entry) => `${entry.raw} -> ${entry.message}`)
+            .join("\n")}`
+        : "";
 
       const context = session.resolvePageContext();
       const transportConfig = session.transport.getConfig();
-      const lines = [
+      const summaryLines = [
+        `已加载: ${session.store.stats.count} | 可见: ${session.store.stats.visibleCount} | 已屏蔽: ${session.store.stats.filteredCount}`,
+        `显示区域: ${Math.round(settings.displayRegionRatio * 100)}% (仅滚动弹幕)`,
+        `已启用类型: ${MODE_KEYS.filter((mode) => !settings.blockedModes[mode]).map((mode) => MODE_LABELS[mode]).join(" / ") || "无"}`,
+        `关键词规则: ${settings.blockedKeywords.length} 条`,
+        `正则规则: ${settings.blockedRegexes.length} 条`,
+        (session.invalidRegexes || []).length ? `失效正则: ${(session.invalidRegexes || []).length} 条` : "失效正则: 0 条",
+      ];
+      this.summaryStats.textContent = summaryLines.join("\n");
+
+      const matchLines = [
         `当前路由: ${session.route.routeKey}`,
         `当前标题: ${context?.title || "未解析"}`,
-        `当前集数: ${context?.episode ?? "未解析"}`,
+        `当前集数: ${context?.episode == null ? "未解析" : context.episode}`,
         match ? `匹配结果: ${match.animeTitle} / ${match.episodeTitle}` : "匹配结果: 未匹配",
         match ? `来源: ${match.sourceName}` : `来源: ${session.lastEndpoint?.sourceName || "暂无"}`,
         `弹幕数: ${session.store.stats.count}`,
         `状态: ${session.statusMessage || "空闲"}`,
         `自定义 API: ${transportConfig.customApiPrefix || "未设置"}`,
       ];
-      this.stats.textContent = lines.join("\n");
+      this.matchStats.textContent = matchLines.join("\n");
+      this.syncControlStates();
     }
   }
 
@@ -1764,7 +2759,7 @@
       this.route = route;
       this.token = app.nextToken();
       this.destroyed = false;
-      this.settings = storageGet(SETTINGS_KEY, DEFAULT_SETTINGS);
+      this.settings = normalizeSettings(storageGet(SETTINGS_KEY, DEFAULT_SETTINGS));
       this.transport = app.transport;
       this.store = new DanmakuStore();
       this.renderer = new Renderer(this);
@@ -1779,6 +2774,7 @@
       this.bootstrapPromise = null;
       this.lastEndpoint = null;
       this.cachedContext = null;
+      this.invalidRegexes = [];
     }
 
     makeAbortController() {
@@ -1804,37 +2800,68 @@
       this.abortAll();
       this.scheduler.destroy();
       this.renderer.destroy();
+      this.panel.destroy();
       this.video = null;
       this.playerContainer = null;
       this.cachedContext = null;
     }
 
     bindVideo(video) {
-      if (!video || this.video === video) {
+      if (!video) {
         return;
       }
+      const isSameVideo = this.video === video;
       this.video = video;
       this.playerContainer = video.closest("section[player]") || video.parentElement || video;
+      if (isSameVideo) {
+        this.panel.attach(this.playerContainer, this.renderer.overlay);
+        this.panel.update();
+        return;
+      }
       this.renderer.attach(this.playerContainer);
-      this.panel.attach(this.renderer.overlay);
+      this.panel.attach(this.playerContainer, this.renderer.overlay);
       this.scheduler.setVideo(video);
       this.panel.update();
     }
 
     saveSettings() {
+      this.settings = normalizeSettings(this.settings);
       storageSet(SETTINGS_KEY, this.settings);
     }
 
     updateSetting(key, value) {
       if (key === "enabled") {
         this.settings.enabled = !!value;
+      } else if (key === "blockedKeywords" || key === "blockedRegexes") {
+        this.settings[key] = normalizeStringList(value);
+      } else if (key === "blockedModes") {
+        this.settings.blockedModes = Object.assign({}, this.settings.blockedModes, value || {});
       } else {
         const limit = SETTING_LIMITS[key];
         this.settings[key] = clamp(safeNumber(value, this.settings[key]), limit.min, limit.max);
       }
       this.saveSettings();
-      this.renderer.clear();
-      this.scheduler.refreshFromCurrentTime(false);
+      this.refreshVisibleComments();
+    }
+
+    setBlockedMode(mode, blocked) {
+      if (!MODE_KEYS.includes(mode)) {
+        return;
+      }
+      this.updateSetting("blockedModes", {
+        [mode]: !!blocked,
+      });
+    }
+
+    refreshVisibleComments(options = {}) {
+      const { clearOverlay = true } = options;
+      const filterResult = applyCommentFilters(this.store.items, this.settings);
+      this.invalidRegexes = filterResult.invalidRegexes;
+      this.store.setVisibilityStats(filterResult.comments.length);
+      if (clearOverlay) {
+        this.renderer.clear();
+      }
+      this.scheduler.setComments(filterResult.comments);
       this.panel.update();
     }
 
@@ -1938,6 +2965,7 @@
       this.currentMatch = null;
       this.store.clear();
       this.renderer.clear();
+      this.invalidRegexes = [];
       this.scheduler.setComments([]);
       this.setStatus(removeCache ? "已清除当前匹配" : "已移除当前匹配，准备重新匹配", removeCache ? "空闲" : "重试中");
       this.panel.update();
@@ -2227,7 +3255,7 @@
       this.lastEndpoint = response.endpoint;
       const comments = this.normalizeComments(response.data, match, response.endpoint.sourceName || match.sourceName);
       this.store.replace(comments, match, response.endpoint.sourceName || match.sourceName);
-      this.scheduler.setComments(this.store.items);
+      this.refreshVisibleComments();
       this.setStatus(`已加载 ${this.store.stats.count} 条弹幕`, "就绪");
       this.panel.update();
     }
@@ -2241,6 +3269,9 @@
       this.routeHref = "";
       this.observer = null;
       this.intervalId = 0;
+      this.ensureScheduled = false;
+      this.ensureForcePending = false;
+      this.ensureFrameId = 0;
       this.boot();
     }
 
@@ -2252,16 +3283,17 @@
     boot() {
       installStyles();
       this.patchHistory();
-      this.observeDom();
-      this.intervalId = window.setInterval(() => this.ensureSession(), 900);
-      window.addEventListener("popstate", () => this.ensureSession(true), true);
-      window.addEventListener("anich-ddm-route-change", () => this.ensureSession(true), true);
-      if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", () => this.ensureSession(true), { once: true });
-      } else {
-        this.ensureSession(true);
-      }
       this.installDebugApi();
+      this.observeDom();
+      this.intervalId = window.setInterval(() => this.scheduleEnsureSession(), 1200);
+      window.addEventListener("popstate", () => this.scheduleEnsureSession(true), true);
+      document.addEventListener("fullscreenchange", () => this.scheduleEnsureSession(true), true);
+      window.addEventListener("anich-ddm-route-change", () => this.scheduleEnsureSession(true), true);
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => this.scheduleEnsureSession(true), { once: true });
+      } else {
+        this.scheduleEnsureSession(true);
+      }
     }
 
     patchHistory() {
@@ -2279,11 +3311,26 @@
 
     observeDom() {
       this.observer = new MutationObserver(() => {
-        this.ensureSession();
+        this.scheduleEnsureSession();
       });
       this.observer.observe(document.documentElement, {
         subtree: true,
         childList: true,
+      });
+    }
+
+    scheduleEnsureSession(force = false) {
+      this.ensureForcePending = this.ensureForcePending || force;
+      if (this.ensureScheduled) {
+        return;
+      }
+      this.ensureScheduled = true;
+      this.ensureFrameId = requestAnimationFrame(() => {
+        this.ensureScheduled = false;
+        this.ensureFrameId = 0;
+        const nextForce = this.ensureForcePending;
+        this.ensureForcePending = false;
+        this.ensureSession(nextForce);
       });
     }
 
@@ -2348,8 +3395,16 @@
                 store: this.activeSession.store.stats,
                 endpoint: this.activeSession.lastEndpoint,
                 settings: this.activeSession.settings,
+                invalidRegexes: this.activeSession.invalidRegexes,
+                controls: {
+                  settingsBound: !!this.activeSession.panel.settingsEntry,
+                  toggleBound: !!this.activeSession.panel.toggleEntry,
+                  panelOpen: !!this.activeSession.panel.panel?.classList.contains("is-open"),
+                  toolbarPosition: this.activeSession.panel.toolbarPosition,
+                },
               }
             : null,
+        openPanel: () => this.activeSession?.panel.openPanel(),
         openMatcher: () => this.activeSession?.panel.openMatcher(),
         clearMatch: () => this.activeSession?.clearCurrentMatch(true),
         toggle: () => {
