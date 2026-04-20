@@ -71,6 +71,9 @@
     side: "right",
     top: 0,
   });
+  const CONTEXT_WAIT_TIMEOUT_MS = 500;
+  const CONTEXT_WAIT_INTERVAL_MS = 50;
+  const CONTEXT_WAIT_WINDOWS = 2;
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
@@ -332,6 +335,48 @@
         .replace(/\b(?:1080p|720p|2160p|x264|x265|hevc|aac|bdrip|webrip|web-dl|baha|bilibili|mkv|mp4)\b/gi, " ")
         .replace(/\s+-\s+(?:OVA|OAD|SP|END|完)$/i, " ")
     );
+  }
+
+  function cleanSiteTitleSuffix(title) {
+    return normalizeSpace(
+      String(title || "")
+        .replace(/\s+-\s*动漫\s*-\s*在线观看\s*-\s*AniCh\s*-\s*动漫弹幕网\s*$/i, " ")
+        .replace(/\s+-\s*AniCh\s*-\s*动漫弹幕网\s*$/i, " ")
+    );
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => {
+      window.setTimeout(resolve, ms);
+    });
+  }
+
+  function getBangumiDataByRoute(route) {
+    const data = window.$data || {};
+    return data[`bangumi-${route?.bangumiId}`]?.data || null;
+  }
+
+  function getNormalizedText(selector, root = document) {
+    return normalizeSpace(root?.querySelector?.(selector)?.textContent || "");
+  }
+
+  function readPageContextSignals(route) {
+    const bangumiData = getBangumiDataByRoute(route);
+    const bangumiTitle = normalizeSpace(bangumiData?.title || "");
+    const playerInfoTitle = getNormalizedText("section[player-info] a[title]");
+    const headerEpisodeTitle = getNormalizedText("section[header='true'] section[title]");
+    const currentEpisodeTitle = normalizeSpace(
+      document.querySelector("a[aria-current='page'][item][title]")?.getAttribute("title") || ""
+    );
+    const documentTitle = cleanSiteTitleSuffix(document.title || "");
+    return {
+      bangumiData,
+      hasBangumiTitle: !!bangumiTitle,
+      seriesTitle: bangumiTitle || playerInfoTitle || documentTitle,
+      episodeTitle: headerEpisodeTitle || currentEpisodeTitle || documentTitle,
+      contextSource: bangumiTitle ? "bangumiData" : playerInfoTitle ? "playerInfo" : "documentTitleFallback",
+      altTitles: Array.isArray(bangumiData?.titles) ? bangumiData.titles.filter(Boolean) : [],
+    };
   }
 
   function cleanFileNameNoise(name) {
@@ -2897,27 +2942,19 @@
       return `${context.normalizedTitleKey}::S${context.season || 1}::E${context.episode || 0}`;
     }
 
-    resolvePageContext(force = false) {
-      if (!force && this.cachedContext && this.cachedContext.routeKey === this.route.routeKey) {
-        return this.cachedContext;
-      }
-
-      const data = window.$data || {};
-      const bangumiData = data[`bangumi-${this.route.bangumiId}`]?.data || {};
-      const rawTitle = bangumiData.title || document.querySelector("section title")?.textContent || document.title || "";
-      const altTitles = Array.isArray(bangumiData.titles) ? bangumiData.titles.filter(Boolean) : [];
-      const playerTitle =
-        document.querySelector("section[header='true'] section title")?.textContent ||
-        document.querySelector("section title")?.textContent ||
-        "";
-      const episode = extractEpisodeNumber(playerTitle) || this.route.episodeRouteId || null;
+    buildPageContext(signals) {
+      const nextSignals = signals || readPageContextSignals(this.route);
+      const rawTitle = normalizeSpace(nextSignals.seriesTitle || nextSignals.episodeTitle || "");
+      const pageTitle = normalizeSpace(nextSignals.episodeTitle || rawTitle);
+      const altTitles = Array.isArray(nextSignals.altTitles) ? nextSignals.altTitles.filter(Boolean) : [];
+      const episode = extractEpisodeNumber(pageTitle) || this.route.episodeRouteId || null;
       const bangumiSeason = extractSeasonNumber(rawTitle) || 1;
-      const title = cleanTitleTail(rawTitle || playerTitle);
+      const title = cleanTitleTail(rawTitle || pageTitle);
       const parsedTitle = parseSearchKeyword(title);
-      const baseTitle = parsedTitle.title || title || playerTitle || "";
+      const baseTitle = parsedTitle.title || title || pageTitle || "";
       const aliases = Array.from(
         new Set(
-          [baseTitle, ...altTitles, playerTitle]
+          [baseTitle, rawTitle, ...altTitles, pageTitle]
             .map((value) => cleanTitleTail(String(value || "").replace(/^第\s*\d+\s*(?:集|话|話)\s*/i, "")))
             .filter(Boolean)
         )
@@ -2925,9 +2962,9 @@
       const season = parsedTitle.season || bangumiSeason || 1;
       const searchTitle = season > 1 ? `${baseTitle} 第${season}季` : baseTitle;
       const normalizedTitleKey = normalizeTitle(baseTitle);
-      const context = {
+      return {
         routeKey: this.route.routeKey,
-        pageTitle: playerTitle,
+        pageTitle,
         title: baseTitle,
         normalizedTitle: normalizeTitle(searchTitle),
         normalizedTitleKey,
@@ -2936,7 +2973,52 @@
         aliases,
         searchTitle,
         seriesPreferenceKey: normalizedTitleKey,
+        contextSource: nextSignals.contextSource || "documentTitleFallback",
       };
+    }
+
+    async waitForBangumiTitle(token, timeoutMs = CONTEXT_WAIT_TIMEOUT_MS, intervalMs = CONTEXT_WAIT_INTERVAL_MS) {
+      const deadline = Date.now() + timeoutMs;
+      while (this.isFresh(token) && Date.now() < deadline) {
+        if (normalizeSpace(getBangumiDataByRoute(this.route)?.title || "")) {
+          return true;
+        }
+        await sleep(intervalMs);
+      }
+      return !!normalizeSpace(getBangumiDataByRoute(this.route)?.title || "");
+    }
+
+    async resolvePageContextReady(token) {
+      this.cachedContext = null;
+      let signals = readPageContextSignals(this.route);
+      if (signals.hasBangumiTitle) {
+        const context = this.buildPageContext(signals);
+        this.cachedContext = context;
+        return context;
+      }
+
+      for (let attempt = 0; attempt < CONTEXT_WAIT_WINDOWS; attempt += 1) {
+        await this.waitForBangumiTitle(token);
+        if (!this.isFresh(token)) {
+          return null;
+        }
+        signals = readPageContextSignals(this.route);
+        if (signals.hasBangumiTitle) {
+          break;
+        }
+      }
+
+      const context = this.buildPageContext(signals);
+      this.cachedContext = context;
+      return context;
+    }
+
+    resolvePageContext(force = false) {
+      if (!force && this.cachedContext && this.cachedContext.routeKey === this.route.routeKey) {
+        return this.cachedContext;
+      }
+
+      const context = this.buildPageContext(readPageContextSignals(this.route));
       this.cachedContext = context;
       return context;
     }
@@ -2983,7 +3065,10 @@
       const token = this.token;
       this.bootstrapPromise = (async () => {
         this.setStatus("正在解析页面信息...", "初始化");
-        const context = this.resolvePageContext(true);
+        const context = await this.resolvePageContextReady(token);
+        if (!this.isFresh(token)) {
+          return;
+        }
         if (!context?.title) {
           this.setStatus("未能解析页面标题，请使用手动匹配。", "待匹配");
           return;
@@ -3396,6 +3481,7 @@
                 endpoint: this.activeSession.lastEndpoint,
                 settings: this.activeSession.settings,
                 invalidRegexes: this.activeSession.invalidRegexes,
+                contextSource: this.activeSession.resolvePageContext()?.contextSource || null,
                 controls: {
                   settingsBound: !!this.activeSession.panel.settingsEntry,
                   toggleBound: !!this.activeSession.panel.toggleEntry,

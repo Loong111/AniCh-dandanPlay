@@ -38,6 +38,7 @@
 3. Verify sparse scrolling danmaku fill from the top of the configured region and `opacity` only changes alpha, not vertical position.
 4. Verify the external toolbar can be dragged, remembers its side/vertical position after reload, and still stays outside the player card.
 5. Verify type filters, keyword filters, and regex filters still work with the toolbar-only control model.
+6. Verify `/b/37922/2` and `/b/37928/3` both resolve a clean anime title without AniCh site suffix leakage.
 
 ## Session Log
 | Date | Session | Summary |
@@ -47,3 +48,4 @@
 | 2026-04-19 | 3 | Added native control takeover, display-region separation, opacity fix, filtering controls, and a new enhancement tracking phase pending manual browser verification |
 | 2026-04-19 | 4 | Reworked controls into a toolbar-only external entry, fixed top-first scroll lane selection, finalized opacity animation variables, and refreshed Phase 4 verification targets |
 | 2026-04-19 | 5 | Added draggable toolbar persistence with remembered side and vertical offset, and exposed the saved position through the debug stats payload |
+| 2026-04-19 | 6 | Stabilized page-context title resolution by waiting for AniCh `$data`, correcting title selectors, and sanitizing `document.title` fallback paths |

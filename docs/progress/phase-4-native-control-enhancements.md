@@ -18,6 +18,7 @@
 ## Phase Notes
 - Local static validation completed with `node --check` plus structural assertions for toolbar-only control flow, opacity animation variables, top-first scroll lane selection, and filter pipeline presence.
 - The toolbar now persists `left/right + top offset` under local storage and keeps the panel anchored to the same side after drag/reload.
+- Title resolution now waits for AniCh `window.$data` twice before falling back, uses `section[title]`-based selectors, and strips AniCh site suffixes from `document.title` fallback values.
 - Browser validation remains the release gate for this enhancement phase.
 
 ## Phase Completion Checklist
