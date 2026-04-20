@@ -31,8 +31,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
 2. Import [`anich-danmaku-fix.user.js`](./anich-danmaku-fix.user.js) into the extension.
-3. If you host this repository on GitHub, you can also install from the raw file URL.
-4. Open an AniCh episode page under `/b/*` and refresh once after enabling the script.
+3. Open an AniCh episode page under `/b/*` and refresh once after enabling the script.
 
 ## Usage
 

@@ -31,8 +31,7 @@
 
 1. 先安装 Tampermonkey 或 Violentmonkey。
 2. 将 [`anich-danmaku-fix.user.js`](./anich-danmaku-fix.user.js) 导入扩展。
-3. 如果你把仓库上传到 GitHub，也可以直接使用该文件的 raw 地址安装。
-4. 打开 AniCh 的 `/b/*` 播放页，在启用脚本后刷新一次页面。
+3. 打开 AniCh 的 `/b/*` 播放页，在启用脚本后刷新一次页面。
 
 ## 使用说明
 
