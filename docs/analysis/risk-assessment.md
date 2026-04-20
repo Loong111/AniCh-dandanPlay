@@ -4,52 +4,52 @@
 
 | Principle | Status | Key Findings | Transformation Priority |
 |:----------|:-------|:-------------|:------------------------|
-| **S** Single Purpose | 🟡 | Current script is small but mixes bootstrap, routing, and interception | High |
-| **U** Unidirectional Flow | 🔴 | Data still flows through AniCh's opaque internal danmaku pipeline | High |
-| **P** Ports over Implementation | 🔴 | No normalized danmaku schema; render logic depends on upstream site objects | High |
+| **S** Single Purpose | 🟡 | Runtime boundaries are clear, but the userscript remains a large single file | Medium |
+| **U** Unidirectional Flow | 🟢 | Data flows from page context and Dandanplay transport into normalization, filtering, scheduling, and rendering | Low |
+| **P** Ports over Implementation | 🟢 | Renderer and filters consume normalized danmaku objects instead of raw API payloads | Low |
 | **E** Environment-Agnostic | 🟢 | No build or backend requirement; browser-only target is stable | Low |
-| **R** Replaceable Parts | 🔴 | Any change to store/render behavior requires replacing the whole workaround | High |
+| **R** Replaceable Parts | 🟡 | Runtime parts are logically separated, but single-file packaging still raises replacement cost | Medium |
 
-**Overall Health**: _1/5 principles healthy_ — Technical Debt Alert
+**Overall Health**: _3/5 principles healthy, 2 partial_ — Acceptable for a build-free userscript with single-file tradeoffs
 
 ### S.U.P.E.R Violation Hotspots
 1. `anich-danmaku-fix.user.js`
-   - No dedicated store, scheduler, or renderer boundary.
-   - Cannot prevent native pipeline contamination if AniCh caches or reuses old state internally.
-2. AniCh native player danmaku runtime
-   - External async loaders can still race across episode changes.
-   - Rendering and request lifecycle are coupled to internal state arrays.
-3. Data contracts across sources
-   - Local protobuf, bili protobuf, and QQ JSON differ, but the current workaround never owns a unified schema.
+   - The script now has dedicated runtime boundaries, but they still share one large file.
+   - Large UI, transport, and session changes are harder to review than they would be in a multi-file layout.
+2. AniCh page runtime coupling
+   - Title selectors, route parsing, player container selection, and fullscreen host rebinding depend on AniCh DOM conventions.
+   - AniCh SPA updates can break matching or toolbar placement without warning.
+3. Dandanplay API dependency
+   - Search, bangumi lookup, and comment loading all depend on reachable Dandanplay-compatible endpoints.
+   - Proxy availability and endpoint behavior directly affect userscript reliability.
 
 ## Risk Matrix
 
 | Risk | Impact | Likelihood | Severity | Mitigation |
 |:-----|:-------|:-----------|:---------|:-----------|
-| Upstream bundle selectors or request paths change | High | Medium | High | Keep source matching narrow and isolate URL classification in `FetchInterceptor` |
-| Shadow response from old episode arrives after navigation | High | High | Critical | Enforce `sessionToken` on every shadow request and drop stale responses |
-| Protobuf parsing drifts from site format | High | Medium | High | Reuse the site's current field mapping and keep parsing isolated in `ParserAdapters` |
+| AniCh selectors, route signals, or player DOM change | High | Medium | High | Keep selector logic isolated in session/context helpers and re-run manual Phase 4 checks after AniCh updates |
+| Dandanplay API or proxies become unavailable | High | Medium | High | Keep custom API override, last-good endpoint memory, and multiple proxy candidates |
+| Matching chooses the wrong anime or episode | Medium | Medium | Medium | Keep manual search/match flow, preference cache, and episode confirmation path available |
 | Overlay attaches to the wrong container after fullscreen or DOM rebuild | Medium | Medium | Medium | Rebind on route changes, DOM mutation, video replacement, and resize |
-| Duplicate comments from multi-source aggregation | Medium | High | High | Use primary and fallback dedupe keys in `DanmakuStore` |
-| Native danmaku UI conflicts with the new pipeline | Medium | Medium | Medium | Hide native danmaku section and send controls; keep plugin UI self-contained |
+| Invalid or expensive regex filters degrade usability | Low | Medium | Low | Validate regex rules, surface invalid entries, and keep filtering before scheduling |
 
 ## High-Severity Risks
 
-### Session contamination
-The core failure mode is stale response injection after route changes. The fix cannot rely on upstream state reset order. The new architecture must rotate a token on every session invalidation and reject all shadow responses that return with an old token.
+### API availability
+The userscript depends on Dandanplay-compatible endpoints for search, bangumi lookup, and comment fetches. If both built-in proxies fail and no custom API prefix is configured, the script has no data source to render.
 
-### Parser correctness
-Both local and bili sources use protobuf payloads. If field numbers are wrong, the renderer will quietly display broken timing or malformed colors. Parser logic must stay source-local and return only `NormalizedDanmaku[]`.
+### Matching correctness
+AniCh page titles are not always a perfect search key. Auto-match can drift when title aliases, season numbering, or episode metadata are incomplete, so manual confirmation must remain available.
 
 ### DOM lifecycle churn
 AniCh is an SPA. History changes, player re-renders, or fullscreen transitions can detach the original `video` node. The session layer must destroy observers, RAF loops, and overlay state before rebinding.
 
 ## Technical Debt
-- Existing workaround delegates too much trust to AniCh's internal danmaku state.
-- No current test harness exists for protobuf parsing or live-site smoke validation.
-- No reusable local debug surface exists beyond browser console inspection.
+- The userscript is still a large single file even though runtime concerns are logically separated.
+- No current automated browser harness exists for full AniCh + userscript regression validation.
+- The debug surface exists under `window.__anichDanmaku__`, but it is still browser-console-oriented rather than a dedicated diagnostics UI.
 
 ## Compatibility Concerns
-- The userscript intentionally aborts native danmaku requests. This depends on AniCh continuing to catch request errors without breaking video playback.
 - The script targets only `https://anich.emmmm.eu.org/b/*`.
-- v1 intentionally excludes danmaku sending, manual search, account features, and cross-site abstraction.
+- The script depends on a userscript manager such as Tampermonkey or Violentmonkey.
+- v1 intentionally excludes danmaku sending, account features, and cross-site abstraction.

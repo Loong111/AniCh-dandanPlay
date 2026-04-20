@@ -1,0 +1,33 @@
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# Node / frontend tooling
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+
+# Local project work artifacts
+.codex/
+output/

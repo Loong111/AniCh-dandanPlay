@@ -1,8 +1,8 @@
 # Task Breakdown
 
 ## Overview
-- **Total Phases**: 3
-- **Total Tasks**: 7
+- **Total Phases**: 4
+- **Total Tasks**: 10
 - **Estimated Total Effort**: L
 
 ## S.U.P.E.R Design Constraints
@@ -16,7 +16,7 @@
 - **R (Replaceable Parts)**: Parser adapters, store policy, scheduler, and renderer must be swappable without touching the rest of the file's contracts.
 
 ## Phase 1: Foundation
-**Goal**: Replace the patch-only workaround with a takeover runtime that owns session state and request flow.
+**Goal**: Establish AniCh session lifecycle, page context parsing, and Dandanplay request flow for the userscript runtime.
 **Prerequisite**: Existing script analyzed and request sources confirmed.
 **S.U.P.E.R Focus**: `S`, `U`, `P`
 
@@ -50,7 +50,7 @@
 | B | 6 | L | Medium | `anich-danmaku-fix.user.js` |
 
 ## Phase 3: Controls And Verification
-**Goal**: Ship the minimal control surface and validate the takeover against the target bug class.
+**Goal**: Ship the minimal control surface and validate the userscript on live AniCh playback.
 **Prerequisite**: Phase 2 complete.
 **S.U.P.E.R Focus**: `S`, `E`, `R`
 
@@ -62,4 +62,19 @@
 ### Parallel Lanes
 | Lane | Tasks | Combined Effort | Merge Risk | Key Files |
 |:-----|:------|:----------------|:-----------|:----------|
-| A | 7, 8 | M | Low | `anich-danmaku-fix.user.js`, `verification.md` |
+| A | 7, 8 | M | Low | `anich-danmaku-fix.user.js`, `docs/progress/phase-3-controls-and-verification.md`, `docs/progress/MASTER.md` |
+
+## Phase 4: Control Corrections
+**Goal**: Finalize the toolbar-only control model and close the remaining live-browser validation gaps.
+**Prerequisite**: Phase 3 complete.
+**S.U.P.E.R Focus**: `S`, `U`, `R`
+
+| # | Task | Priority | Effort | Depends On | Lane | S.U.P.E.R | Acceptance Criteria |
+|:--|:-----|:---------|:-------|:-----------|:-----|:----------|:--------------------|
+| 9 | Implement display-region, opacity, filtering, and external-toolbar corrections | P0 | M | 8 | A | S, U, R | The toolbar is the only control entry; `displayRegionRatio` affects only scrolling lanes; sparse scrolling comments fill from the top; opacity changes alpha only; type/keyword/regex filters all apply before scheduling |
+| 10 | Run manual browser verification for the corrected toolbar-only model | P0 | M | 9 | A | U, R | Live AniCh playback confirms toolbar placement, drag persistence, `25%` display-region behavior, opacity-only alpha changes, filtering, seek/pause/fullscreen/route-change usability, and clean title resolution |
+
+### Parallel Lanes
+| Lane | Tasks | Combined Effort | Merge Risk | Key Files |
+|:-----|:------|:----------------|:-----------|:----------|
+| A | 9, 10 | M | Low | `anich-danmaku-fix.user.js`, `docs/progress/phase-4-native-control-enhancements.md`, `docs/progress/MASTER.md` |

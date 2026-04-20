@@ -2,40 +2,40 @@
 
 | Module | Responsibility | Dependencies | Files | Lines | Complexity | S.U.P.E.R Score |
 |:-------|:---------------|:-------------|------:|------:|:-----------|:----------------|
-| Current userscript guard | Inject a document-start fetch wrapper that drops stale danmaku responses after navigation | Browser DOM APIs, AniCh fetch behavior | 1 | 106 | Medium | `S🟡 U🟡 P🔴 E🟢 R🔴` |
+| Current userscript runtime | Provide AniCh-specific Dandanplay matching, transport, store, scheduler, renderer, and controls in one userscript | Browser DOM APIs, AniCh page structure, Dandanplay API | 1 | ~3500 | High | `S🟡 U🟢 P🟢 E🟢 R🟡` |
 
 ## Module Details
 
-### Current userscript guard
+### Current userscript runtime
 - **Path**: `anich-danmaku-fix.user.js`
-- **Responsibility**: Patch `window.fetch` so danmaku responses from a previous route throw `AbortError`.
-- **Public API**: None.
-- **Internal Dependencies**: None.
-- **External Dependencies**: Browser `window.fetch`, DOM injection timing, AniCh route format `/b/:bangumi/:episode`.
-- **Complexity Rating**: Medium
+- **Responsibility**: Provide the full AniCh-side Dandanplay danmaku runtime, including page-context resolution, matching, transport, normalization, filtering, rendering, and controls.
+- **Public API**: Debug helpers exposed under `window.__anichDanmaku__`.
+- **Internal Dependencies**: Logical in-file boundaries for `DandanplayTransport`, `DanmakuStore`, `Renderer`, `Scheduler`, `ControlPanel`, and `Session`.
+- **External Dependencies**: Browser `fetch`, DOM injection timing, AniCh route format `/b/:bangumi/:episode`, AniCh page title/container selectors, Dandanplay API.
+- **Complexity Rating**: High
 - **Transformation Notes**:
-  - The file mixes bootstrap, route parsing, request classification, and interception in one place.
-  - It assumes upstream rendering can remain trusted after stale responses are dropped, which is false for the reported bug class.
-  - It exposes no normalization contract, no store boundary, and no independent renderer.
+  - The script is intentionally build-free and single-file, so logical boundaries matter more than file count.
+  - The runtime already separates transport, store, scheduler, renderer, and controls, but they still live in one large file.
+  - The normalized danmaku contract keeps Dandanplay response handling isolated from rendering and filtering.
 - **S.U.P.E.R Assessment**:
-  - **S (Single Purpose)**: Partial. It fixes one bug class, but injection, route parsing, and request classification are tightly coupled.
-  - **U (Unidirectional Flow)**: Partial. Fetch interception is one-way, but there is no separated data pipeline.
-  - **P (Ports over Implementation)**: Violation. No explicit normalized danmaku contract exists.
+  - **S (Single Purpose)**: Partial. Runtime responsibilities are decomposed into classes, but the file still hosts many concerns.
+  - **U (Unidirectional Flow)**: Healthy. Runtime flow is page context -> Dandanplay transport -> normalization -> filter/store -> schedule -> render.
+  - **P (Ports over Implementation)**: Healthy. The renderer consumes normalized comment objects instead of raw transport payloads.
   - **E (Environment-Agnostic)**: Healthy. No local file paths or environment-specific build steps.
-  - **R (Replaceable Parts)**: Violation. Replacing interception or rendering behavior requires rewriting the only file.
+  - **R (Replaceable Parts)**: Partial. Runtime parts are logically replaceable, but the single-file packaging still raises edit cost.
 
-## Planned Runtime Boundaries
+## Current Runtime Boundaries
 
-### SessionManager
-- **Responsibility**: Route/session lifecycle, token rotation, video/container rebinding, teardown.
-- **Boundary Contract**: `{ token, episodeKey, video, container }`
+### Session
+- **Responsibility**: Route/session lifecycle, settings, match cache, video/container rebinding, and orchestration across runtime parts.
+- **Boundary Contract**: `{ token, route, currentMatch, settings, video, playerContainer }`
 
-### FetchInterceptor
-- **Responsibility**: Classify danmaku requests, spawn shadow fetches with the current token, abort native danmaku requests.
-- **Boundary Contract**: `{ sourceKind, url, token, episodeKey } -> Promise<ArrayBuffer|Object>`
+### DandanplayTransport
+- **Responsibility**: Search anime/episodes, fetch bangumi metadata, fetch comments, and manage proxy/custom API fallback.
+- **Boundary Contract**: `{ apiBase, path, params } -> { endpoint, data }`
 
-### ParserAdapters
-- **Responsibility**: Convert local protobuf, bili protobuf, and QQ JSON into `NormalizedDanmaku[]`.
+### Normalization
+- **Responsibility**: Convert Dandanplay `/comment` payloads into `NormalizedDanmaku[]`.
 - **Boundary Contract**:
   - `id`
   - `source`
@@ -44,16 +44,20 @@
   - `mode`
   - `color`
   - `date`
-  - `episodeKey`
+  - `episodeId`
 
 ### DanmakuStore
-- **Responsibility**: Deduplicate, sort, merge incrementally, expose stats.
-- **Boundary Contract**: `merge(items)`, `clear()`, `lowerBound(time)`, `stats()`
+- **Responsibility**: Deduplicate, sort, replace current episode comments, and expose visibility/source stats.
+- **Boundary Contract**: `replace(items, match, sourceName)`, `clear()`, `setVisibilityStats(count)`
 
 ### Scheduler
 - **Responsibility**: Translate `video.currentTime` into pending emits.
-- **Boundary Contract**: `sync(videoTime) -> NormalizedDanmaku[]`
+- **Boundary Contract**: `setComments(items)`, `setVideo(video)`, `refreshFromCurrentTime(clearOverlay)`
 
 ### Renderer
-- **Responsibility**: Overlay creation, lane allocation, DOM animation, basic UI.
-- **Boundary Contract**: `render(items)`, `pause()`, `resume()`, `clear()`, `destroy()`
+- **Responsibility**: Overlay creation, lane allocation, DOM animation, and visual playback of normalized comments.
+- **Boundary Contract**: `attach(container)`, `emit(comment)`, `syncPaused(isPaused)`, `clear()`, `destroy()`
+
+### ControlPanel
+- **Responsibility**: External toolbar, settings panel, manual matcher, filters, and status display.
+- **Boundary Contract**: `attach(container, overlay)`, `update()`, `openPanel()`, `openMatcher()`, `destroy()`

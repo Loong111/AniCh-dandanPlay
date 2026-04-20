@@ -26,4 +26,11 @@ graph TD
         T6 --> T7
         T7 --> T8
     end
+
+    subgraph Phase4 [Phase 4: Control Corrections]
+        T9[Task 9: Toolbar-only Corrections]
+        T10[Task 10: Manual Browser Verification]
+        T8 --> T9
+        T9 --> T10
+    end
 ```
