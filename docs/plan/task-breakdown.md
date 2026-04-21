@@ -1,8 +1,8 @@
 # Task Breakdown
 
 ## Overview
-- **Total Phases**: 4
-- **Total Tasks**: 10
+- **Total Phases**: 5
+- **Total Tasks**: 12
 - **Estimated Total Effort**: L
 
 ## S.U.P.E.R Design Constraints
@@ -78,3 +78,18 @@
 | Lane | Tasks | Combined Effort | Merge Risk | Key Files |
 |:-----|:------|:----------------|:-----------|:----------|
 | A | 9, 10 | M | Low | `anich-danmaku-fix.user.js`, `docs/progress/phase-4-native-control-enhancements.md`, `docs/progress/MASTER.md` |
+
+## Phase 5: Skip Cue Prompt
+**Goal**: Detect danmaku skip markers, surface a non-blocking jump prompt, and leave final playback verification to user-run manual checks.
+**Prerequisite**: Phase 4 complete.
+**S.U.P.E.R Focus**: `S`, `U`, `R`
+
+| # | Task | Priority | Effort | Depends On | Lane | S.U.P.E.R | Acceptance Criteria |
+|:--|:-----|:---------|:-------|:-----------|:-----|:----------|:--------------------|
+| 11 | Implement `SkipCue` parsing, prompt lifecycle, and debug exposure | P0 | M | 10 | A | S, U, R | The runtime extracts the first valid `空降` cue from normalized sorted comments, shows a right-bottom prompt when playback reaches the cue trigger, auto-closes after `5s` or target-time arrival, supports rewind re-arm, and exposes cue/prompt state through `window.__anichDanmaku__.getStats()` |
+| 12 | Run user-owned manual verification for skip prompt behavior | P1 | S | 11 | A | U, R | User confirms normal jump, invalid-first fallback, duplicate-cue precedence, rewind re-trigger, and teardown behavior across seek/fullscreen/route changes |
+
+### Parallel Lanes
+| Lane | Tasks | Combined Effort | Merge Risk | Key Files |
+|:-----|:------|:----------------|:-----------|:----------|
+| A | 11, 12 | M | Low | `anich-danmaku-fix.user.js`, `docs/progress/phase-5-skip-cue-prompt.md`, `docs/progress/MASTER.md`, `.codex/skills/anich-danmaku-takeover-dev/SKILL.md` |

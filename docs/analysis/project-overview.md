@@ -13,10 +13,11 @@ graph TD
     S --> D[DanmakuStore]
     S --> C[Scheduler]
     C --> R[Renderer]
+    C --> K[SkipPrompt]
     S --> P[ControlPanel]
 ```
 
-The repository currently contains a single-file userscript that owns the AniCh-side Dandanplay workflow end to end. It resolves page context, searches Dandanplay entries, loads episode comments, normalizes them into a single schema, filters and schedules them against the active video, renders them in an overlay, and exposes an external toolbar plus settings panel.
+The repository currently contains a single-file userscript that owns the AniCh-side Dandanplay workflow end to end. It resolves page context, searches Dandanplay entries, loads episode comments, normalizes them into a single schema, filters and schedules them against the active video, renders them in an overlay, exposes an external toolbar plus settings panel, and now derives a separate skip-cue prompt path from normalized comments.
 
 The runtime is organized as a single-file userscript injected at `document-start` and split into these logical boundaries:
 
@@ -26,6 +27,7 @@ The runtime is organized as a single-file userscript injected at `document-start
 - `DanmakuStore`
 - `Scheduler`
 - `Renderer`
+- `SkipPrompt`
 - `ControlPanel`
 
 ## Technology Stack

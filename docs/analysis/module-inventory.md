@@ -2,20 +2,20 @@
 
 | Module | Responsibility | Dependencies | Files | Lines | Complexity | S.U.P.E.R Score |
 |:-------|:---------------|:-------------|------:|------:|:-----------|:----------------|
-| Current userscript runtime | Provide AniCh-specific Dandanplay matching, transport, store, scheduler, renderer, and controls in one userscript | Browser DOM APIs, AniCh page structure, Dandanplay API | 1 | ~3500 | High | `S🟡 U🟢 P🟢 E🟢 R🟡` |
+| Current userscript runtime | Provide AniCh-specific Dandanplay matching, transport, store, scheduler, renderer, skip prompt, and controls in one userscript | Browser DOM APIs, AniCh page structure, Dandanplay API | 1 | ~3800 | High | `S🟡 U🟢 P🟢 E🟢 R🟡` |
 
 ## Module Details
 
 ### Current userscript runtime
 - **Path**: `anich-danmaku-fix.user.js`
-- **Responsibility**: Provide the full AniCh-side Dandanplay danmaku runtime, including page-context resolution, matching, transport, normalization, filtering, rendering, and controls.
+- **Responsibility**: Provide the full AniCh-side Dandanplay danmaku runtime, including page-context resolution, matching, transport, normalization, filtering, rendering, skip-cue prompting, and controls.
 - **Public API**: Debug helpers exposed under `window.__anichDanmaku__`.
-- **Internal Dependencies**: Logical in-file boundaries for `DandanplayTransport`, `DanmakuStore`, `Renderer`, `Scheduler`, `ControlPanel`, and `Session`.
+- **Internal Dependencies**: Logical in-file boundaries for `DandanplayTransport`, `DanmakuStore`, `Renderer`, `SkipPrompt`, `Scheduler`, `ControlPanel`, and `Session`.
 - **External Dependencies**: Browser `fetch`, DOM injection timing, AniCh route format `/b/:bangumi/:episode`, AniCh page title/container selectors, Dandanplay API.
 - **Complexity Rating**: High
 - **Transformation Notes**:
   - The script is intentionally build-free and single-file, so logical boundaries matter more than file count.
-  - The runtime already separates transport, store, scheduler, renderer, and controls, but they still live in one large file.
+  - The runtime already separates transport, store, scheduler, renderer, skip prompt, and controls, but they still live in one large file.
   - The normalized danmaku contract keeps Dandanplay response handling isolated from rendering and filtering.
 - **S.U.P.E.R Assessment**:
   - **S (Single Purpose)**: Partial. Runtime responsibilities are decomposed into classes, but the file still hosts many concerns.
@@ -51,12 +51,16 @@
 - **Boundary Contract**: `replace(items, match, sourceName)`, `clear()`, `setVisibilityStats(count)`
 
 ### Scheduler
-- **Responsibility**: Translate `video.currentTime` into pending emits.
-- **Boundary Contract**: `setComments(items)`, `setVideo(video)`, `refreshFromCurrentTime(clearOverlay)`
+- **Responsibility**: Translate `video.currentTime` into pending emits and skip-cue trigger state.
+- **Boundary Contract**: `setComments(items)`, `setSkipCue(cue)`, `setVideo(video)`, `refreshFromCurrentTime(clearOverlay)`
 
 ### Renderer
 - **Responsibility**: Overlay creation, lane allocation, DOM animation, and visual playback of normalized comments.
 - **Boundary Contract**: `attach(container)`, `emit(comment)`, `syncPaused(isPaused)`, `clear()`, `destroy()`
+
+### SkipPrompt
+- **Responsibility**: Show and dismiss the right-bottom skip popup without coupling click behavior into danmaku rendering.
+- **Boundary Contract**: `attach(container)`, `show(cue)`, `dismiss(reason)`, `getState()`, `destroy()`
 
 ### ControlPanel
 - **Responsibility**: External toolbar, settings panel, manual matcher, filters, and status display.

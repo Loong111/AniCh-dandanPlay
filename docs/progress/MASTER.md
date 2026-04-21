@@ -2,7 +2,7 @@
 
 > **Task**: Deliver and maintain an AniCh-specific Dandanplay danmaku userscript.
 > **Started**: 2026-04-19
-> **Last Updated**: 2026-04-20
+> **Last Updated**: 2026-04-22
 
 ## References
 - [Project Overview](../analysis/project-overview.md)
@@ -20,21 +20,23 @@
 | 2 | Data And Rendering | 3 | 3 | 100% |
 | 3 | Controls And Verification | 2 | 2 | 100% |
 | 4 | Control Corrections | 2 | 2 | 100% |
+| 5 | Skip Cue Prompt | 2 | 2 | 100% |
 
 ## Phase Checklist
 - [x] Phase 1: foundation (3/3 tasks) — [details](./phase-1-foundation.md)
 - [x] Phase 2: data-and-rendering (3/3 tasks) — [details](./phase-2-data-and-rendering.md)
 - [x] Phase 3: controls-and-verification (2/2 tasks) — [details](./phase-3-controls-and-verification.md)
 - [x] Phase 4: control-corrections (2/2 tasks) — [details](./phase-4-native-control-enhancements.md)
+- [x] Phase 5: skip-cue-prompt (2/2 tasks) — [details](./phase-5-skip-cue-prompt.md)
 
 ## Current Status
 **Active Phase**: Completed
-**Active Task**: None — all planned phases and manual browser verification are complete
+**Active Task**: None — all planned phases and manual verification items are complete
 **Blockers**: None
 
 ## Next Steps
 1. Publish the repository to GitHub and expose a raw userscript install URL if desired.
-2. Re-run Phase 4 manual checks whenever AniCh changes its player DOM, title selectors, or danmaku-related request paths.
+2. Re-run Phase 5 manual checks whenever AniCh changes its player DOM, route behavior, or bottom control bar structure.
 3. Consider tagging a release or archiving the planning artifacts once the repository layout is finalized.
 
 ## Session Log
@@ -47,3 +49,5 @@
 | 2026-04-19 | 5 | Added draggable toolbar persistence with remembered side and vertical offset, and exposed the saved position through the debug stats payload |
 | 2026-04-19 | 6 | Stabilized page-context title resolution by waiting for AniCh `$data`, correcting title selectors, and sanitizing `document.title` fallback paths |
 | 2026-04-20 | 7 | User completed manual browser verification for Phase 4 and cleared the remaining release gate; progress and planning docs were marked complete |
+| 2026-04-21 | 8 | Implemented skip-cue parsing, right-bottom jump prompt lifecycle, rewind re-arm, debug exposure, and appended a new Phase 5 pending user manual verification |
+| 2026-04-22 | 9 | User completed manual verification for the skip prompt and bottom-control-bar fix; Phase 5 was marked complete |

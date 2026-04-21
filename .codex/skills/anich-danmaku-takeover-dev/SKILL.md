@@ -78,7 +78,13 @@ Before marking any task as complete, verify ALL of the following:
   - `mode`
   - `color`
   - `date`
-  - `episodeKey`
+  - `episodeId`
+- Treat `SkipCue` as a separate serializable side-channel contract derived from normalized comments only:
+  - `sourceCommentId`
+  - `triggerTime`
+  - `targetTime`
+  - `targetLabel`
+  - `sourceText`
 - Do not let the renderer read protobuf- or source-specific fields.
 - Route/session invalidation is mandatory. Every network response must be checked against the active session token before merge.
 - Prefer browser-native APIs only. No CDN runtime, no build step, no third-party library.
@@ -88,22 +94,24 @@ Before marking any task as complete, verify ALL of the following:
 ## 5. Project-Specific Architecture Context
 
 ### Violation Hotspots To Fix
-- `anich-danmaku-fix.user.js` currently mixes bootstrap, routing, and interception with no owned renderer.
-- AniCh native danmaku state is not trustworthy across fast episode changes.
-- Multi-source payloads have no unified contract.
+- `anich-danmaku-fix.user.js` still concentrates runtime boundaries inside one large file, so review cost remains high.
+- AniCh title selectors, route signals, player container rebinding, and fullscreen host selection still depend on site DOM conventions.
+- `SkipCue` parsing is heuristic and depends on user-authored `空降` timestamp formats, so final playback verification remains manual.
 
 ### Required Layering
-- `FetchInterceptor` owns request classification and shadow fetch.
-- `ParserAdapters` owns source parsing and emits only `NormalizedDanmaku[]`.
+- `DandanplayTransport` owns episode search, bangumi fetch, comment fetch, and API fallback.
 - `DanmakuStore` owns dedupe, sorting, and stats.
 - `Scheduler` owns time-window selection.
 - `Renderer` owns overlay and animation.
-- `SessionManager` owns lifecycle, teardown, and rebinding.
+- `SkipPrompt` owns jump-popup UI, timeout, and click affordance.
+- `ControlPanel` owns toolbar, settings panel, manual matcher, and status views.
+- `Session` owns lifecycle, teardown, matching, and rebinding.
 
 ### Mandatory Runtime Rules
 - Match only `https://anich.emmmm.eu.org/b/*`.
-- Abort native danmaku requests after shadow fetch is queued.
-- Hide native `section[danmaku]` and native danmaku input/control entry points in v1.
+- Keep the Dandanplay comment payload normalized before it reaches store, scheduler, renderer, or skip-cue logic.
+- Keep `SkipCue` derived from normalized comments as a separate side-channel; do not fold click behavior into `Renderer`.
+- Hide native `section[danmaku]` and native danmaku input/control entry points in the custom runtime.
 - Do not implement danmaku sending in v1.
 
 ## 6. Progress Update Instructions

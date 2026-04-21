@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.1.1
+// @version      2.2.0
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -98,7 +98,10 @@
     "section[episode]",
   ]);
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.1";
+  const USER_AGENT = "AniChDanmakuFix/2.2";
+  const SKIP_CUE_KEYWORD = "空降";
+  const MIN_SKIP_CUE_LEAD_SECONDS = 3;
+  const SKIP_PROMPT_DURATION_MS = 5000;
   const STOP_WORDS = new Set([
     "第",
     "季",
@@ -273,6 +276,99 @@
       comments: filtered,
       invalidRegexes: compiled.invalid,
     };
+  }
+
+  function formatClockTime(totalSeconds) {
+    const clampedSeconds = Math.max(0, Math.floor(safeNumber(totalSeconds, 0)));
+    const hours = Math.floor(clampedSeconds / 3600);
+    const minutes = Math.floor((clampedSeconds % 3600) / 60);
+    const seconds = clampedSeconds % 60;
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+    return `${Math.floor(clampedSeconds / 60)}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function parseSkipCueTimeToken(token) {
+    const normalized = String(token || "").trim().replace(/：/g, ":");
+    if (!normalized) {
+      return null;
+    }
+
+    if (/^\d+\.\d{2}$/.test(normalized)) {
+      const [minutesText, secondsText] = normalized.split(".");
+      const minutes = safeNumber(minutesText, NaN);
+      const seconds = safeNumber(secondsText, NaN);
+      if (!Number.isFinite(minutes) || !Number.isFinite(seconds) || seconds >= 60) {
+        return null;
+      }
+      return minutes * 60 + seconds;
+    }
+
+    if (!/^\d+(?::\d{2}){1,2}$/.test(normalized)) {
+      return null;
+    }
+
+    const parts = normalized.split(":").map((value) => safeNumber(value, NaN));
+    if (parts.some((value) => !Number.isFinite(value))) {
+      return null;
+    }
+    if (parts.length === 2) {
+      const [minutes, seconds] = parts;
+      return seconds >= 60 ? null : minutes * 60 + seconds;
+    }
+    const [hours, minutes, seconds] = parts;
+    if (minutes >= 60 || seconds >= 60) {
+      return null;
+    }
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+
+  function extractSkipCue(text) {
+    const normalizedText = normalizeSpace(text);
+    const markerIndex = normalizedText.indexOf(SKIP_CUE_KEYWORD);
+    if (markerIndex < 0) {
+      return null;
+    }
+    const tail = normalizedText.slice(markerIndex + SKIP_CUE_KEYWORD.length);
+    const tokenMatch = tail.match(/(\d+(?:[：:]\d{2}){1,2}|\d+\.\d{2})/);
+    if (!tokenMatch) {
+      return null;
+    }
+    const targetTime = parseSkipCueTimeToken(tokenMatch[1]);
+    if (!Number.isFinite(targetTime)) {
+      return null;
+    }
+    return {
+      targetTime,
+      targetLabel: formatClockTime(targetTime),
+      matchedToken: tokenMatch[1],
+    };
+  }
+
+  function findFirstSkipCue(comments, minLeadSeconds = MIN_SKIP_CUE_LEAD_SECONDS) {
+    const list = Array.isArray(comments) ? comments : [];
+    for (const comment of list) {
+      if (!comment?.text || !comment.text.includes(SKIP_CUE_KEYWORD)) {
+        continue;
+      }
+      const parsed = extractSkipCue(comment.text);
+      if (!parsed) {
+        continue;
+      }
+      const triggerTime = safeNumber(comment.time, 0);
+      if (parsed.targetTime - triggerTime < minLeadSeconds) {
+        continue;
+      }
+      return {
+        sourceCommentId: String(comment.id || `${comment.source}:${comment.text}:${round1(triggerTime)}`),
+        triggerTime,
+        targetTime: parsed.targetTime,
+        targetLabel: parsed.targetLabel,
+        sourceText: comment.text,
+      };
+    }
+    return null;
   }
 
   function createControlIcon(role) {
@@ -813,6 +909,74 @@
         pointer-events: none;
         contain: layout style size;
         font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+
+      .anich-ddm-skip-prompt {
+        position: absolute;
+        right: 16px;
+        bottom: 72px;
+        z-index: 2147483002;
+        width: min(20rem, calc(100% - 32px));
+        display: flex;
+        justify-content: flex-end;
+        opacity: 0;
+        visibility: hidden;
+        transform: translate3d(0, 12px, 0);
+        transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s linear 0.18s;
+        pointer-events: none;
+      }
+
+      .anich-ddm-skip-prompt.is-visible {
+        opacity: 1;
+        visibility: visible;
+        transform: translate3d(0, 0, 0);
+        transition-delay: 0s;
+      }
+
+      .anich-ddm-skip-button {
+        width: min(20rem, 100%);
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        padding: 11px 14px;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: rgba(8, 12, 20, 0.74);
+        color: rgba(241, 248, 255, 0.96);
+        box-shadow: 0 14px 32px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(18px);
+        text-align: left;
+        cursor: pointer;
+        pointer-events: none;
+        transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+      }
+
+      .anich-ddm-skip-prompt.is-visible .anich-ddm-skip-button {
+        pointer-events: auto;
+      }
+
+      .anich-ddm-skip-button:hover {
+        transform: translateY(-1px);
+        border-color: rgba(146, 218, 255, 0.52);
+        background: rgba(12, 18, 28, 0.82);
+      }
+
+      .anich-ddm-skip-eyebrow {
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        color: rgba(170, 222, 255, 0.9);
+      }
+
+      .anich-ddm-skip-title {
+        font-size: 14px;
+        font-weight: 700;
+        color: rgba(247, 251, 255, 0.98);
+      }
+
+      .anich-ddm-skip-meta {
+        font-size: 12px;
+        color: rgba(214, 225, 235, 0.84);
       }
 
       .anich-ddm-overlay.is-paused .anich-ddm-item {
@@ -1766,6 +1930,198 @@
     }
   }
 
+  class SkipPrompt {
+    constructor(session) {
+      this.session = session;
+      this.container = null;
+      this.root = null;
+      this.button = null;
+      this.eyebrow = null;
+      this.title = null;
+      this.meta = null;
+      this.closeTimer = 0;
+      this.countdownTimer = 0;
+      this.deadlineAt = 0;
+      this.activeCue = null;
+      this.visible = false;
+      this.state = {
+        visible: false,
+        shownAt: 0,
+        lastAction: "idle",
+        lastCueId: null,
+        targetLabel: "",
+        targetTime: null,
+        remainingSeconds: 0,
+      };
+      this.handleClick = this.handleClick.bind(this);
+    }
+
+    attach(container) {
+      if (!container) {
+        return;
+      }
+      if (this.container === container && this.root?.isConnected) {
+        return;
+      }
+      this.destroyNode();
+      this.container = container;
+      const computed = window.getComputedStyle(container);
+      if (computed.position === "static") {
+        container.style.position = "relative";
+      }
+      this.root = createElement("div", "anich-ddm-skip-prompt");
+      this.root.setAttribute("aria-hidden", "true");
+      this.button = createElement("button", "anich-ddm-skip-button");
+      this.button.type = "button";
+      this.button.disabled = true;
+      this.button.addEventListener("click", this.handleClick);
+      this.eyebrow = createElement("div", "anich-ddm-skip-eyebrow", "检测到空降");
+      this.title = createElement("div", "anich-ddm-skip-title", "点击跳转");
+      this.meta = createElement("div", "anich-ddm-skip-meta", "");
+      this.button.append(this.eyebrow, this.title, this.meta);
+      this.root.appendChild(this.button);
+      container.appendChild(this.root);
+    }
+
+    destroyNode() {
+      this.clearTimer();
+      if (this.button) {
+        this.button.removeEventListener("click", this.handleClick);
+      }
+      if (this.root?.isConnected) {
+        this.root.remove();
+      }
+      this.root = null;
+      this.button = null;
+      this.eyebrow = null;
+      this.title = null;
+      this.meta = null;
+      this.visible = false;
+    }
+
+    clearTimer() {
+      if (this.closeTimer) {
+        clearTimeout(this.closeTimer);
+        this.closeTimer = 0;
+      }
+      if (this.countdownTimer) {
+        clearInterval(this.countdownTimer);
+        this.countdownTimer = 0;
+      }
+      this.deadlineAt = 0;
+    }
+
+    updateCountdownText() {
+      if (!this.meta || !this.activeCue) {
+        return;
+      }
+      const remainingSeconds = Math.max(0, Math.ceil((this.deadlineAt - Date.now()) / 1000));
+      this.meta.textContent = `跳转至 ${this.activeCue.targetLabel} · 剩余 ${remainingSeconds} 秒`;
+      this.state.remainingSeconds = remainingSeconds;
+    }
+
+    show(skipCue) {
+      if (!skipCue) {
+        return;
+      }
+      if (!this.root?.isConnected && this.session.playerContainer) {
+        this.attach(this.session.playerContainer);
+      }
+      if (!this.root || !this.button || !this.meta || !this.title) {
+        return;
+      }
+      this.clearTimer();
+      this.activeCue = Object.assign({}, skipCue);
+      this.deadlineAt = Date.now() + SKIP_PROMPT_DURATION_MS;
+      this.title.textContent = "点击跳过片头";
+      this.button.title = `跳转至 ${skipCue.targetLabel}`;
+      this.button.disabled = false;
+      this.root.setAttribute("aria-hidden", "false");
+      this.root.classList.add("is-visible");
+      this.visible = true;
+      this.state = {
+        visible: true,
+        shownAt: Date.now(),
+        lastAction: "shown",
+        lastCueId: skipCue.sourceCommentId || null,
+        targetLabel: skipCue.targetLabel || "",
+        targetTime: safeNumber(skipCue.targetTime, null),
+        remainingSeconds: Math.ceil(SKIP_PROMPT_DURATION_MS / 1000),
+      };
+      this.updateCountdownText();
+      this.countdownTimer = window.setInterval(() => {
+        this.updateCountdownText();
+      }, 250);
+      this.closeTimer = window.setTimeout(() => {
+        this.session.scheduler.handleSkipPromptTimeout();
+        this.dismiss("timeout");
+      }, SKIP_PROMPT_DURATION_MS);
+    }
+
+    dismiss(reason = "dismissed") {
+      this.clearTimer();
+      if (this.root) {
+        this.root.classList.remove("is-visible");
+        this.root.setAttribute("aria-hidden", "true");
+      }
+      if (this.button) {
+        this.button.disabled = true;
+      }
+      this.visible = false;
+      this.state.visible = false;
+      this.state.lastAction = reason;
+      this.state.remainingSeconds = 0;
+      if (reason === "reset" || reason === "rearm" || reason === "destroy") {
+        this.activeCue = null;
+      }
+    }
+
+    handleClick(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const cue = this.activeCue;
+      const video = this.session.video;
+      if (!cue || !video) {
+        return;
+      }
+      this.session.scheduler.markSkipCueClicked();
+      video.currentTime = cue.targetTime;
+      this.dismiss("clicked");
+    }
+
+    isVisible() {
+      return this.visible;
+    }
+
+    getState() {
+      return {
+        visible: this.state.visible,
+        shownAt: this.state.shownAt,
+        lastAction: this.state.lastAction,
+        lastCueId: this.state.lastCueId,
+        targetLabel: this.state.targetLabel,
+        targetTime: this.state.targetTime,
+        remainingSeconds: this.state.remainingSeconds,
+      };
+    }
+
+    destroy() {
+      this.dismiss("destroy");
+      this.destroyNode();
+      this.container = null;
+      this.activeCue = null;
+      this.state = {
+        visible: false,
+        shownAt: 0,
+        lastAction: "destroy",
+        lastCueId: null,
+        targetLabel: "",
+        targetTime: null,
+        remainingSeconds: 0,
+      };
+    }
+  }
+
   class Scheduler {
     constructor(session) {
       this.session = session;
@@ -1775,7 +2131,30 @@
       this.lastTargetTime = null;
       this.lastVideo = null;
       this.running = false;
+      this.skipCue = null;
+      this.skipCueState = this.createSkipCueState(null, 0);
       this.tick = this.tick.bind(this);
+    }
+
+    createSkipCueState(skipCue, targetTime) {
+      if (!skipCue) {
+        return {
+          armed: false,
+          shownAt: 0,
+          dismissed: false,
+          clicked: false,
+          reason: "none",
+        };
+      }
+      const beforeTrigger = targetTime < skipCue.triggerTime - 0.05;
+      const pastTarget = targetTime >= skipCue.targetTime - 0.05;
+      return {
+        armed: beforeTrigger && !pastTarget,
+        shownAt: 0,
+        dismissed: pastTarget || !beforeTrigger,
+        clicked: false,
+        reason: pastTarget ? "past-target" : beforeTrigger ? "armed" : "missed",
+      };
     }
 
     setComments(comments) {
@@ -1784,7 +2163,17 @@
       this.start();
     }
 
+    setSkipCue(skipCue) {
+      this.skipCue = skipCue ? Object.assign({}, skipCue) : null;
+      const targetTime = (this.session.video?.currentTime || 0) + this.session.settings.offset;
+      this.skipCueState = this.createSkipCueState(this.skipCue, targetTime);
+      this.session.skipPrompt.dismiss("reset");
+    }
+
     setVideo(video) {
+      if (this.lastVideo && this.lastVideo !== video) {
+        this.session.skipPrompt.dismiss("rebind");
+      }
       this.lastVideo = video || null;
       this.refreshFromCurrentTime(false);
       if (video) {
@@ -1813,6 +2202,8 @@
       this.comments = [];
       this.cursor = 0;
       this.lastTargetTime = null;
+      this.skipCue = null;
+      this.skipCueState = this.createSkipCueState(null, 0);
     }
 
     refreshFromCurrentTime(clearOverlay = true) {
@@ -1823,6 +2214,7 @@
       if (clearOverlay) {
         this.session.renderer.clear();
       }
+      this.syncSkipCueForCurrentTime(targetTime);
     }
 
     lowerBound(targetTime) {
@@ -1839,6 +2231,112 @@
       return left;
     }
 
+    syncSkipCueForCurrentTime(targetTime) {
+      if (!this.skipCue) {
+        this.skipCueState = this.createSkipCueState(null, targetTime);
+        this.session.skipPrompt.dismiss("empty");
+        return;
+      }
+
+      if (targetTime < this.skipCue.triggerTime - 0.05) {
+        if (!this.skipCueState.armed || this.skipCueState.dismissed || this.skipCueState.clicked || this.skipCueState.shownAt) {
+          this.skipCueState = {
+            armed: true,
+            shownAt: 0,
+            dismissed: false,
+            clicked: false,
+            reason: "armed",
+          };
+        }
+        this.session.skipPrompt.dismiss("rearm");
+        return;
+      }
+
+      if (targetTime >= this.skipCue.targetTime - 0.05) {
+        this.skipCueState = Object.assign({}, this.skipCueState, {
+          armed: false,
+          dismissed: true,
+          reason: this.skipCueState.clicked ? "clicked" : "past-target",
+        });
+        this.session.skipPrompt.dismiss("past-target");
+        return;
+      }
+
+      if (this.skipCueState.armed) {
+        this.skipCueState = Object.assign({}, this.skipCueState, {
+          armed: false,
+          dismissed: true,
+          reason: "missed",
+        });
+        this.session.skipPrompt.dismiss("missed");
+      }
+    }
+
+    maybeShowSkipCue(previousTargetTime, targetTime, isPaused) {
+      if (!this.skipCue) {
+        return;
+      }
+      if (targetTime >= this.skipCue.targetTime - 0.05) {
+        this.skipCueState = Object.assign({}, this.skipCueState, {
+          armed: false,
+          dismissed: true,
+          reason: this.skipCueState.clicked ? "clicked" : "past-target",
+        });
+        this.session.skipPrompt.dismiss("past-target");
+        return;
+      }
+      if (
+        isPaused ||
+        previousTargetTime === null ||
+        !this.skipCueState.armed ||
+        this.skipCueState.dismissed ||
+        this.skipCueState.clicked
+      ) {
+        return;
+      }
+      const threshold = this.skipCue.triggerTime - 0.05;
+      if (previousTargetTime < threshold && targetTime >= threshold) {
+        this.skipCueState = {
+          armed: false,
+          shownAt: Date.now(),
+          dismissed: false,
+          clicked: false,
+          reason: "shown",
+        };
+        this.session.skipPrompt.show(this.skipCue);
+      }
+    }
+
+    handleSkipPromptTimeout() {
+      if (!this.skipCue) {
+        return;
+      }
+      this.skipCueState = Object.assign({}, this.skipCueState, {
+        armed: false,
+        dismissed: true,
+        reason: "timeout",
+      });
+    }
+
+    markSkipCueClicked() {
+      if (!this.skipCue) {
+        return;
+      }
+      this.skipCueState = Object.assign({}, this.skipCueState, {
+        armed: false,
+        dismissed: true,
+        clicked: true,
+        reason: "clicked",
+      });
+    }
+
+    getSkipCueDebugState() {
+      return {
+        cue: this.skipCue ? Object.assign({}, this.skipCue) : null,
+        state: Object.assign({}, this.skipCueState),
+      };
+    }
+
     tick() {
       if (!this.running || this.session.destroyed) {
         return;
@@ -1850,7 +2348,7 @@
       }
 
       this.session.renderer.syncPaused(video.paused);
-      if (this.session.settings.enabled && this.comments.length) {
+      if (this.comments.length || this.skipCue) {
         const targetTime = video.currentTime + this.session.settings.offset;
         if (
           this.lastTargetTime === null ||
@@ -1859,9 +2357,11 @@
         ) {
           this.refreshFromCurrentTime(true);
         }
+        const previousTargetTime = this.lastTargetTime;
         this.lastTargetTime = targetTime;
+        this.maybeShowSkipCue(previousTargetTime, targetTime, video.paused);
 
-        if (!video.paused) {
+        if (this.session.settings.enabled && this.comments.length && !video.paused) {
           while (this.cursor < this.comments.length && this.comments[this.cursor].time <= targetTime + 0.05) {
             this.session.renderer.emit(this.comments[this.cursor]);
             this.cursor += 1;
@@ -2808,6 +3308,7 @@
       this.transport = app.transport;
       this.store = new DanmakuStore();
       this.renderer = new Renderer(this);
+      this.skipPrompt = new SkipPrompt(this);
       this.scheduler = new Scheduler(this);
       this.panel = new ControlPanel(this);
       this.currentMatch = null;
@@ -2845,6 +3346,7 @@
       this.abortAll();
       this.scheduler.destroy();
       this.renderer.destroy();
+      this.skipPrompt.destroy();
       this.panel.destroy();
       this.video = null;
       this.playerContainer = null;
@@ -2859,11 +3361,13 @@
       this.video = video;
       this.playerContainer = video.closest("section[player]") || video.parentElement || video;
       if (isSameVideo) {
+        this.skipPrompt.attach(this.playerContainer);
         this.panel.attach(this.playerContainer, this.renderer.overlay);
         this.panel.update();
         return;
       }
       this.renderer.attach(this.playerContainer);
+      this.skipPrompt.attach(this.playerContainer);
       this.panel.attach(this.playerContainer, this.renderer.overlay);
       this.scheduler.setVideo(video);
       this.panel.update();
@@ -3047,6 +3551,7 @@
       this.currentMatch = null;
       this.store.clear();
       this.renderer.clear();
+      this.scheduler.setSkipCue(null);
       this.invalidRegexes = [];
       this.scheduler.setComments([]);
       this.setStatus(removeCache ? "已清除当前匹配" : "已移除当前匹配，准备重新匹配", removeCache ? "空闲" : "重试中");
@@ -3095,6 +3600,7 @@
           if (this.isFresh(token)) {
             this.currentMatch = null;
             this.store.clear();
+            this.scheduler.setSkipCue(null);
             this.scheduler.setComments([]);
             this.renderer.clear();
             this.setStatus("自动匹配失败，请手动搜索并确认。", "待匹配");
@@ -3340,6 +3846,7 @@
       this.lastEndpoint = response.endpoint;
       const comments = this.normalizeComments(response.data, match, response.endpoint.sourceName || match.sourceName);
       this.store.replace(comments, match, response.endpoint.sourceName || match.sourceName);
+      this.scheduler.setSkipCue(findFirstSkipCue(this.store.items));
       this.refreshVisibleComments();
       this.setStatus(`已加载 ${this.store.stats.count} 条弹幕`, "就绪");
       this.panel.update();
@@ -3482,6 +3989,8 @@
                 settings: this.activeSession.settings,
                 invalidRegexes: this.activeSession.invalidRegexes,
                 contextSource: this.activeSession.resolvePageContext()?.contextSource || null,
+                skipCue: this.activeSession.scheduler.getSkipCueDebugState(),
+                skipPrompt: this.activeSession.skipPrompt.getState(),
                 controls: {
                   settingsBound: !!this.activeSession.panel.settingsEntry,
                   toggleBound: !!this.activeSession.panel.toggleEntry,

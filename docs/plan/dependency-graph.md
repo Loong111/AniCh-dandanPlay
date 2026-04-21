@@ -33,4 +33,11 @@ graph TD
         T8 --> T9
         T9 --> T10
     end
+
+    subgraph Phase5 [Phase 5: Skip Cue Prompt]
+        T11[Task 11: SkipCue + Prompt]
+        T12[Task 12: User Manual Verification]
+        T10 --> T11
+        T11 --> T12
+    end
 ```
