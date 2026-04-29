@@ -88,6 +88,7 @@ Before marking any task as complete, verify ALL of the following:
 - Do not let the renderer read protobuf- or source-specific fields.
 - Route/session invalidation is mandatory. Every network response must be checked against the active session token before merge.
 - Prefer browser-native APIs only. No CDN runtime, no build step, no third-party library.
+- Keep Bilibili import requests inside userscript-authorized transport boundaries; do not spread `GM_xmlhttpRequest` calls across UI code.
 - Persist settings under `anichDanmaku:*` keys only.
 - Keep debug output minimal and expose inspection through `window.__anichDanmaku__`.
 
@@ -97,19 +98,28 @@ Before marking any task as complete, verify ALL of the following:
 - `anich-danmaku-fix.user.js` still concentrates runtime boundaries inside one large file, so review cost remains high.
 - AniCh title selectors, route signals, player container rebinding, and fullscreen host selection still depend on site DOM conventions.
 - `SkipCue` parsing is heuristic and depends on user-authored `空降` timestamp formats, so final playback verification remains manual.
+- Bilibili import now depends on userscript grant mode and cross-origin request boundaries, so page-window access and transport responsibilities must stay isolated.
+- Cross-episode Bilibili import now needs route-scoped multi-binding caches plus multiple season-scoped BV/page-offset chains, so binding identity, chain restore precedence, and per-chain clear semantics must remain centralized inside `Session`.
 
 ### Required Layering
 - `DandanplayTransport` owns episode search, bangumi fetch, comment fetch, and API fallback.
-- `DanmakuStore` owns dedupe, sorting, and stats.
+- `BilibiliTransport` owns BV parsing follow-up requests, PGC bangumi `ep` metadata resolution, short-link resolution, `cid` lookup, and segmented protobuf danmaku fetch/normalization.
+- `DanmakuStore` owns source buckets, dedupe, sorting, and stats.
 - `Scheduler` owns time-window selection.
 - `Renderer` owns overlay and animation.
 - `SkipPrompt` owns jump-popup UI, timeout, and click affordance.
-- `ControlPanel` owns toolbar, settings panel, manual matcher, and status views.
+- `ControlPanel` owns toolbar, hover import popover, imported-link list UI, settings panel, manual matcher, and status views.
 - `Session` owns lifecycle, teardown, matching, and rebinding.
 
 ### Mandatory Runtime Rules
 - Match only `https://anich.emmmm.eu.org/b/*`.
 - Keep the Dandanplay comment payload normalized before it reaches store, scheduler, renderer, or skip-cue logic.
+- Keep imported Bilibili comments normalized into the same `NormalizedDanmaku` contract before they enter `DanmakuStore`.
+- Preserve one source bucket per imported Bilibili binding using stable keys such as `import:bilibili:<bindingKey>`; refreshing the same binding updates that bucket in place, while different bindings may coexist and merge.
+- Preserve route-scoped Bilibili import collections and season-scoped chain collections separately; restore precedence applies per chain as `explicit route binding > derived route binding > live chain derivation`, and all matching chains merge on the target AniCh episode unless the user explicitly asks for a priority model.
+- Bilibili PGC bangumi `ep` links must resolve through `pgc/view/web/season` and derive by `season_id + episode number offset`, not raw `ep_id + n`, because official Bilibili `ep_id` values may stop being consecutive mid-season.
+- Per-link clear removes only the selected binding plus that chain's derived route entries; a route-level clear-all may remove every active Bilibili binding on the current AniCh route without touching unrelated explicit imports on other routes.
+- If a derived chain currently points at a missing `p`, skip that chain for the current visit but keep the chain cached so later AniCh visits can auto-restore once the Bilibili side has that page.
 - Keep `SkipCue` derived from normalized comments as a separate side-channel; do not fold click behavior into `Renderer`.
 - Hide native `section[danmaku]` and native danmaku input/control entry points in the custom runtime.
 - Do not implement danmaku sending in v1.

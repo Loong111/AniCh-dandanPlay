@@ -1,9 +1,9 @@
 # Task Breakdown
 
 ## Overview
-- **Total Phases**: 5
-- **Total Tasks**: 12
-- **Estimated Total Effort**: L
+- **Total Phases**: 6
+- **Total Tasks**: 17
+- **Estimated Total Effort**: XL
 
 ## S.U.P.E.R Design Constraints
 
@@ -93,3 +93,21 @@
 | Lane | Tasks | Combined Effort | Merge Risk | Key Files |
 |:-----|:------|:----------------|:-----------|:----------|
 | A | 11, 12 | M | Low | `anich-danmaku-fix.user.js`, `docs/progress/phase-5-skip-cue-prompt.md`, `docs/progress/MASTER.md`, `.codex/skills/anich-danmaku-takeover-dev/SKILL.md` |
+
+## Phase 6: Bilibili Import Overlay
+**Goal**: Add a hover-triggered Bilibili import popover, merge one or more imported Bilibili sources into the active session, and persist multiple route-scoped imports plus multiple season-scoped BV and PGC auto-mapping chains.
+**Prerequisite**: Phase 5 complete.
+**S.U.P.E.R Focus**: `P`, `U`, `R`
+
+| # | Task | Priority | Effort | Depends On | Lane | S.U.P.E.R | Acceptance Criteria |
+|:--|:-----|:---------|:-------|:-----------|:-----|:----------|:--------------------|
+| 13 | Implement Bilibili import transport, source buckets, route-scoped persistence, and hover popover controls | P0 | M | 12 | A | P, U, R | The script accepts BV / full video URL / Bilibili bangumi `ep` URL / `b23` short link input, resolves `cid`, loads segmented protobuf danmaku through userscript-authorized requests, replaces the relevant Bilibili source bucket, restores the same import on route reload, and exposes source/import stats through `window.__anichDanmaku__.getStats()` |
+| 14 | Implement cross-episode `?p=` auto mapping with series-level BV/page-offset caching | P0 | M | 13 | A | P, U, R | Explicit `?p=` imports seed one season-scoped BV rule, derived route records never override explicit route imports, restore order is explicit > derived-cache > live series rule, and clearing a rule removes that season's derived imports while preserving other explicit routes |
+| 15 | Upgrade route import collections, per-binding source buckets, and hover popover list UI for multiple Bilibili links | P0 | M | 14 | A | P, U, R | The current AniCh route can keep multiple explicit Bilibili imports at once, each import owns a stable source bucket such as `import:bilibili:<bindingKey>`, re-importing the same binding refreshes it in place, different bindings merge together, and the hover popover shows a per-link summary with remove controls plus a route-level clear-all action |
+| 16 | Upgrade season auto mapping from one rule to multiple coexisting Bilibili chains | P0 | M | 15 | A | P, U, R | Each AniCh season can keep multiple `BV + pageOffset` chains and Bilibili PGC `season_id + episode number` chains, restore precedence is applied per chain as `explicit route binding > derived route binding > live chain derivation`, all matching chains merge on the target AniCh episode instead of competing by priority, and if a derived `p` or PGC episode is currently missing it is skipped for that visit while the chain stays cached for future episodes or future Bilibili availability |
+| 17 | Run static checks and user manual verification for multi-link and multi-chain Bilibili restore behavior | P1 | M | 16 | A | U, R | `node --check` passes, helper samples cover multi-binding cache merge, BV page derivation, PGC season/episode derivation, duplicate chain suppression, and missing-page/episode skip-resume behavior, and the user confirms multiple imported links merge correctly, multiple `?p=` and bangumi `ep` chains can auto-restore together, per-link remove and clear-all behave as designed, and live AniCh playback still handles filtering, seek, fullscreen, pause, and SkipCue correctly |
+
+### Parallel Lanes
+| Lane | Tasks | Combined Effort | Merge Risk | Key Files |
+|:-----|:------|:----------------|:-----------|:----------|
+| A | 13, 14, 15, 16 | L | Medium | `anich-danmaku-fix.user.js`, `docs/plan/task-breakdown.md`, `docs/plan/dependency-graph.md`, `docs/plan/milestones.md`, `docs/progress/MASTER.md`, `docs/progress/phase-6-bilibili-import.md`, `.codex/skills/anich-danmaku-takeover-dev/SKILL.md` |

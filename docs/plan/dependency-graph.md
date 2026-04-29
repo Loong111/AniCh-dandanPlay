@@ -40,4 +40,17 @@ graph TD
         T10 --> T11
         T11 --> T12
     end
+
+    subgraph Phase6 [Phase 6: Bilibili Import Overlay]
+        T13[Task 13: Initial Bilibili Import Overlay]
+        T14[Task 14: Single-Chain p Auto Mapping]
+        T15[Task 15: Multi-Link Route Imports]
+        T16[Task 16: Multi-Chain BV + PGC Season Mapping]
+        T17[Task 17: Multi-Link Verification]
+        T12 --> T13
+        T13 --> T14
+        T14 --> T15
+        T15 --> T16
+        T16 --> T17
+    end
 ```

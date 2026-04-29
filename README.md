@@ -15,6 +15,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - Independent danmaku pipeline for AniCh episode pages.
 - Dandanplay-based comment loading with built-in proxy fallback and custom API prefix support.
 - Automatic title and episode matching, plus manual search and manual match when auto-match is wrong.
+- Bilibili danmaku import for BV/video links, `b23` short links, and official bangumi `ep` links, with multi-link merge and season-chain restore.
 - External toolbar placed outside the player so the video area stays unobstructed.
 - Adjustable font size, display region, opacity, speed, and time offset.
 - Filter controls for danmaku mode, keywords, and regular expressions.
@@ -40,13 +41,15 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 3. Click the settings button to open the control panel.
 4. Adjust basic options such as font size, display region, opacity, speed, and offset.
 5. If auto-match fails, open `Match / Source`, run a manual search, choose an episode, and confirm the match.
-6. Use keyword or regex filters when you want to hide specific comments.
+6. Hover the toolbar settings button to import Bilibili danmaku from a BV/video link, `b23` link, or bangumi `ep` link.
+7. Use keyword or regex filters when you want to hide specific comments.
 
 ## Configuration Notes
 
 - The script stores settings, API configuration, match cache, preference cache, and toolbar position in browser `localStorage`.
 - A custom API prefix can be configured from the panel if you want to route requests through your own Dandanplay-compatible endpoint.
 - Built-in proxy candidates are used automatically when direct access is unavailable.
+- Bilibili import bindings are stored per AniCh route, while BV `?p=` and bangumi `ep` inputs can seed season-level restore chains.
 
 ## Project Structure
 
@@ -70,4 +73,4 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 
 ## Status
 
-Core Dandanplay-based danmaku features are implemented, and the Phase 4 live browser verification checklist has passed on AniCh playback.
+Core Dandanplay-based danmaku features are implemented. Bilibili multi-import and season-chain restore are in Phase 6, with live browser verification still pending for the newest import paths.

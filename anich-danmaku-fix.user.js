@@ -1,32 +1,46 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.2.0
+// @version      2.5.2
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.bilibili.com
+// @connect      comment.bilibili.com
+// @connect      b23.tv
+// @connect      www.bilibili.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  if (window.__anichDanmakuBooted) {
+  const pageWindow = typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : window;
+
+  if (pageWindow.__anichDanmakuBooted) {
     return;
   }
+  pageWindow.__anichDanmakuBooted = true;
   window.__anichDanmakuBooted = true;
 
   const ROUTE_RE = /^\/b\/(\d+)\/(\d+)(?:\/|$)/;
+  const PRIMARY_ROUTE_RE = /^\/b\/(\d+)\/(\d+)\/?$/;
   const STORAGE_PREFIX = "anichDanmaku:";
   const SETTINGS_KEY = `${STORAGE_PREFIX}settings`;
   const API_CONFIG_KEY = `${STORAGE_PREFIX}apiConfig`;
   const MATCH_CACHE_KEY = `${STORAGE_PREFIX}episodeMatchCache`;
   const PREFERENCE_CACHE_KEY = `${STORAGE_PREFIX}seriesPreferenceCache`;
+  const BILIBILI_IMPORT_CACHE_KEY = `${STORAGE_PREFIX}bilibiliImportCache`;
+  const BILIBILI_IMPORT_SERIES_CACHE_KEY = `${STORAGE_PREFIX}bilibiliImportSeriesCache`;
   const TOOLBAR_POSITION_KEY = `${STORAGE_PREFIX}toolbarPosition`;
   const STYLE_ID = "anich-ddm-style";
   const DEBUG_NAMESPACE = "__anichDanmaku__";
   const OFFICIAL_API = "https://api.dandanplay.net/api/v2";
+  const BILIBILI_API = "https://api.bilibili.com";
+  const BILIBILI_DM_SEGMENT_CONCURRENCY = 4;
+  const BILIBILI_DM_SEGMENT_RETRY_COUNT = 1;
   const MODE_KEYS = Object.freeze(["rtl", "ltr", "top", "bottom"]);
   const MODE_LABELS = Object.freeze({
     rtl: "右至左",
@@ -74,6 +88,8 @@
   const CONTEXT_WAIT_TIMEOUT_MS = 500;
   const CONTEXT_WAIT_INTERVAL_MS = 50;
   const CONTEXT_WAIT_WINDOWS = 2;
+  const IMPORT_POPOVER_CLOSE_DELAY_MS = 180;
+  const CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS = 0.2;
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
@@ -97,8 +113,10 @@
     "section[episode] > section[wrap]",
     "section[episode]",
   ]);
+  const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
+  const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.2";
+  const USER_AGENT = "AniChDanmakuFix/2.5.2";
   const SKIP_CUE_KEYWORD = "空降";
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -403,6 +421,1035 @@
     localStorage.setItem(key, JSON.stringify(value));
   }
 
+  function getPageWindow() {
+    return pageWindow;
+  }
+
+  function readPositiveInt(value) {
+    const parsed = parseInt(String(value ?? "").trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  function extractBilibiliBvid(value) {
+    const match = String(value || "").match(/BV[0-9A-Za-z]{10}/i);
+    return match ? `BV${match[0].slice(2)}` : "";
+  }
+
+  function extractBilibiliPgcEpId(value) {
+    const text = String(value || "");
+    const match = text.match(/(?:bangumi\/play\/)?ep(\d+)/i) || text.match(/[?&]ep_id=(\d+)/i);
+    return match ? readPositiveInt(match[1]) : null;
+  }
+
+  function getBilibiliImportSourceType(value) {
+    return value === "pgc" ? "pgc" : "video";
+  }
+
+  function parseBilibiliSyntheticPgcInput(input) {
+    const match = normalizeSpace(input).match(/^pgc:season:(\d+):episode:(\d+)$/i);
+    if (!match) {
+      return null;
+    }
+    return {
+      pgcSeasonId: readPositiveInt(match[1]),
+      pgcEpisodeNumber: readPositiveInt(match[2]),
+    };
+  }
+
+  function parseBilibiliImportInput(rawInput) {
+    const input = normalizeSpace(rawInput);
+    if (!input) {
+      throw new Error("请输入 B 站链接、BV 号或番剧 ep 号");
+    }
+
+    if (!/^[a-z]+:\/\//i.test(input)) {
+      const bvid = extractBilibiliBvid(input);
+      if (bvid) {
+        return {
+          rawInput: input,
+          resolvedUrl: `https://www.bilibili.com/video/${bvid}/`,
+          sourceType: "video",
+          bvid,
+          page: 1,
+          pageExplicit: false,
+        };
+      }
+      const pgcEpId = extractBilibiliPgcEpId(input);
+      if (pgcEpId) {
+        return {
+          rawInput: input,
+          resolvedUrl: buildBilibiliPgcEpisodeUrl(pgcEpId),
+          sourceType: "pgc",
+          bvid: "",
+          pgcEpId,
+          page: 1,
+          pageExplicit: false,
+          pgcEpisodeExplicit: true,
+        };
+      }
+      const syntheticPgc = parseBilibiliSyntheticPgcInput(input);
+      if (syntheticPgc?.pgcSeasonId && syntheticPgc?.pgcEpisodeNumber) {
+        return {
+          rawInput: input,
+          resolvedUrl: input,
+          sourceType: "pgc",
+          bvid: "",
+          pgcSeasonId: syntheticPgc.pgcSeasonId,
+          pgcEpisodeNumber: syntheticPgc.pgcEpisodeNumber,
+          page: 1,
+          pageExplicit: false,
+          pgcEpisodeExplicit: true,
+        };
+      }
+      throw new Error("仅支持 BV 号、B 站视频链接、番剧 ep 链接或 b23 短链");
+    }
+
+    let url = null;
+    try {
+      url = new URL(input);
+    } catch {
+      const bvid = extractBilibiliBvid(input);
+      if (bvid) {
+        return {
+          rawInput: input,
+          resolvedUrl: `https://www.bilibili.com/video/${bvid}/`,
+          sourceType: "video",
+          bvid,
+          page: 1,
+          pageExplicit: false,
+        };
+      }
+      const pgcEpId = extractBilibiliPgcEpId(input);
+      if (pgcEpId) {
+        return {
+          rawInput: input,
+          resolvedUrl: buildBilibiliPgcEpisodeUrl(pgcEpId),
+          sourceType: "pgc",
+          bvid: "",
+          pgcEpId,
+          page: 1,
+          pageExplicit: false,
+          pgcEpisodeExplicit: true,
+        };
+      }
+      const syntheticPgc = parseBilibiliSyntheticPgcInput(input);
+      if (syntheticPgc?.pgcSeasonId && syntheticPgc?.pgcEpisodeNumber) {
+        return {
+          rawInput: input,
+          resolvedUrl: input,
+          sourceType: "pgc",
+          bvid: "",
+          pgcSeasonId: syntheticPgc.pgcSeasonId,
+          pgcEpisodeNumber: syntheticPgc.pgcEpisodeNumber,
+          page: 1,
+          pageExplicit: false,
+          pgcEpisodeExplicit: true,
+        };
+      }
+      throw new Error("链接格式无效，请重新输入");
+    }
+
+    const host = url.hostname.toLowerCase();
+    const pageParam = url.searchParams.get("p");
+    const page = readPositiveInt(pageParam) || 1;
+    const pageExplicit = pageParam != null && pageParam !== "";
+    const pgcEpId = extractBilibiliPgcEpId(url.toString());
+    if (host === "b23.tv" || host === "www.b23.tv") {
+      return {
+        rawInput: input,
+        resolvedUrl: url.toString(),
+        sourceType: "video",
+        bvid: "",
+        page,
+        pageExplicit,
+        shortLink: true,
+      };
+    }
+
+    if (pgcEpId) {
+      return {
+        rawInput: input,
+        resolvedUrl: buildBilibiliPgcEpisodeUrl(pgcEpId),
+        sourceType: "pgc",
+        bvid: "",
+        pgcEpId,
+        page: 1,
+        pageExplicit: false,
+        pgcEpisodeExplicit: true,
+      };
+    }
+
+    const bvid = extractBilibiliBvid(url.toString());
+    if (!bvid) {
+      throw new Error("仅支持 BV 视频链接、番剧 ep 链接，不支持 av 号或其他页面");
+    }
+    return {
+      rawInput: input,
+      resolvedUrl: url.toString(),
+      sourceType: "video",
+      bvid,
+      page,
+      pageExplicit,
+    };
+  }
+
+  function buildBilibiliVideoUrl(bvid, page = 1) {
+    const targetBvid = extractBilibiliBvid(bvid);
+    if (!targetBvid) {
+      return "";
+    }
+    const url = new URL(`https://www.bilibili.com/video/${targetBvid}/`);
+    if ((readPositiveInt(page) || 1) > 1) {
+      url.searchParams.set("p", String(readPositiveInt(page) || 1));
+    }
+    return url.toString();
+  }
+
+  function buildBilibiliPgcEpisodeUrl(pgcEpId) {
+    const normalizedEpId = readPositiveInt(pgcEpId);
+    return normalizedEpId ? `https://www.bilibili.com/bangumi/play/ep${normalizedEpId}` : "";
+  }
+
+  function readBilibiliPgcEpisodeNumber(episode) {
+    return (
+      readPositiveInt(episode?.title) ||
+      extractEpisodeNumber(episode?.show_title || episode?.long_title || episode?.share_copy || "")
+    );
+  }
+
+  function buildBilibiliAttemptRecord(rawInput) {
+    const normalizedInput = normalizeSpace(rawInput);
+    if (!normalizedInput) {
+      return null;
+    }
+    try {
+      const parsed = parseBilibiliImportInput(normalizedInput);
+      return normalizeBilibiliImportRecord({
+        rawInput: parsed.rawInput,
+        resolvedUrl: parsed.resolvedUrl,
+        sourceType: parsed.sourceType,
+        bvid: parsed.bvid,
+        pgcEpId: parsed.pgcEpId,
+        pgcSeasonId: parsed.pgcSeasonId,
+        pgcEpisodeNumber: parsed.pgcEpisodeNumber,
+        page: parsed.page,
+      });
+    } catch {
+      return normalizeBilibiliImportRecord({
+        rawInput: normalizedInput,
+      });
+    }
+  }
+
+  function getBilibiliImportBindingLabel(bindingMode) {
+    return bindingMode === "derived" ? "自动推导" : "显式导入";
+  }
+
+  function getBilibiliImportDerivedStatusLabel(derivedStatus) {
+    if (derivedStatus === "series-rule") {
+      return "待按同季规则恢复";
+    }
+    if (derivedStatus === "derived-cache") {
+      return "已缓存自动推导";
+    }
+    if (derivedStatus === "restored") {
+      return "已按同季规则恢复";
+    }
+    if (derivedStatus === "explicit") {
+      return "当前为显式导入";
+    }
+    return "无";
+  }
+
+  function getBilibiliSeriesKey(context) {
+    if (!context?.normalizedTitleKey) {
+      return "";
+    }
+    return `${context.normalizedTitleKey}::S${safeNumber(context?.season, 1) || 1}`;
+  }
+
+  function buildBilibiliStandaloneBindingKey(bvid, page = 1) {
+    const normalizedBvid = extractBilibiliBvid(bvid || "");
+    const normalizedPage = readPositiveInt(page) || 1;
+    if (!normalizedBvid) {
+      return "";
+    }
+    return `video:${normalizedBvid}:p${normalizedPage}`;
+  }
+
+  function buildBilibiliPgcStandaloneBindingKey(pgcEpId, pgcSeasonId = 0, pgcEpisodeNumber = 0) {
+    const normalizedEpId = readPositiveInt(pgcEpId);
+    if (normalizedEpId) {
+      return `pgc:ep:${normalizedEpId}`;
+    }
+    const normalizedSeasonId = readPositiveInt(pgcSeasonId);
+    const normalizedEpisodeNumber = readPositiveInt(pgcEpisodeNumber);
+    return normalizedSeasonId && normalizedEpisodeNumber
+      ? `pgc:season:${normalizedSeasonId}:episode:${normalizedEpisodeNumber}`
+      : "";
+  }
+
+  function buildBilibiliSeriesChainKey(bvid, pageOffset = 0) {
+    const normalizedBvid = extractBilibiliBvid(bvid || "");
+    const normalizedOffset = Number.isFinite(Number(pageOffset)) ? Number(pageOffset) : 0;
+    if (!normalizedBvid) {
+      return "";
+    }
+    return `chain:${normalizedBvid}:offset:${normalizedOffset >= 0 ? `+${normalizedOffset}` : String(normalizedOffset)}`;
+  }
+
+  function buildBilibiliPgcSeriesChainKey(pgcSeasonId, episodeOffset = 0, anchorPgcEpId = 0) {
+    const normalizedSeasonId = readPositiveInt(pgcSeasonId);
+    const normalizedAnchorEpId = readPositiveInt(anchorPgcEpId);
+    const normalizedOffset = Number.isFinite(Number(episodeOffset)) ? Number(episodeOffset) : 0;
+    const scope = normalizedSeasonId
+      ? `season:${normalizedSeasonId}`
+      : normalizedAnchorEpId
+      ? `anchor:${normalizedAnchorEpId}`
+      : "";
+    if (!scope) {
+      return "";
+    }
+    return `chain:pgc:${scope}:episode-offset:${normalizedOffset >= 0 ? `+${normalizedOffset}` : String(normalizedOffset)}`;
+  }
+
+  function buildBilibiliBindingKey(record) {
+    const chainKey = normalizeSpace(record?.chainKey || "");
+    if (chainKey) {
+      return chainKey;
+    }
+    if (getBilibiliImportSourceType(record?.sourceType) === "pgc" || record?.pgcEpId || record?.pgcSeasonId) {
+      return buildBilibiliPgcStandaloneBindingKey(record?.pgcEpId, record?.pgcSeasonId, record?.pgcEpisodeNumber);
+    }
+    return buildBilibiliStandaloneBindingKey(record?.bvid, record?.page);
+  }
+
+  function getBilibiliImportSourceKey(bindingKey) {
+    const normalizedBindingKey = normalizeSpace(bindingKey || "");
+    return normalizedBindingKey
+      ? `${BILIBILI_IMPORT_SOURCE_PREFIX}:${normalizedBindingKey}`
+      : BILIBILI_IMPORT_SOURCE_PREFIX;
+  }
+
+  function isBilibiliImportRecordLike(value) {
+    return (
+      !!value &&
+      typeof value === "object" &&
+      ("bvid" in value || "pgcEpId" in value || "pgcSeasonId" in value || "rawInput" in value || "resolvedUrl" in value)
+    );
+  }
+
+  function isBilibiliSeriesRuleLike(value) {
+    return (
+      !!value &&
+      typeof value === "object" &&
+      ("bvid" in value || "anchorPgcEpId" in value || "pgcSeasonId" in value || "anchorEpisode" in value || "anchorPage" in value)
+    );
+  }
+
+  function normalizeBilibiliImportRecord(record) {
+    if (!record || typeof record !== "object") {
+      return null;
+    }
+    const normalizedBvid = extractBilibiliBvid(record.bvid || record.resolvedUrl || record.rawInput || "");
+    const normalizedPgcEpId =
+      readPositiveInt(record.pgcEpId || record.epId) || extractBilibiliPgcEpId(record.resolvedUrl || record.rawInput || "");
+    const normalizedPgcSeasonId = readPositiveInt(record.pgcSeasonId || record.seasonId) || null;
+    const normalizedPgcEpisodeNumber = readPositiveInt(record.pgcEpisodeNumber || record.episodeNumber) || null;
+    const normalizedSourceType =
+      record.sourceType === "pgc" || normalizedPgcEpId || (normalizedPgcSeasonId && normalizedPgcEpisodeNumber)
+        ? "pgc"
+        : "video";
+    const normalizedPage = readPositiveInt(record.page) || 1;
+    const normalizedSeriesKey = normalizeSpace(record.seriesKey || "");
+    const normalizedPageOffset = Number.isFinite(Number(record.pageOffset)) ? Number(record.pageOffset) : null;
+    const normalizedEpisodeOffset = Number.isFinite(Number(record.episodeOffset)) ? Number(record.episodeOffset) : null;
+    const normalizedChainKey = normalizeSpace(
+      record.chainKey ||
+        (normalizedSeriesKey
+          ? normalizedSourceType === "pgc" &&
+            (normalizedPgcEpId || normalizedPgcSeasonId) &&
+            normalizedEpisodeOffset != null
+            ? buildBilibiliPgcSeriesChainKey(normalizedPgcSeasonId, normalizedEpisodeOffset, normalizedPgcEpId)
+            : normalizedBvid && normalizedPageOffset != null
+            ? buildBilibiliSeriesChainKey(normalizedBvid, normalizedPageOffset)
+            : ""
+          : "")
+    );
+    const normalizedBindingKey = normalizeSpace(
+      record.bindingKey ||
+        normalizedChainKey ||
+        (normalizedSourceType === "pgc"
+          ? buildBilibiliPgcStandaloneBindingKey(normalizedPgcEpId, normalizedPgcSeasonId, normalizedPgcEpisodeNumber)
+          : buildBilibiliStandaloneBindingKey(normalizedBvid, normalizedPage))
+    );
+    const hasPgcIdentity = normalizedPgcEpId || (normalizedPgcSeasonId && normalizedPgcEpisodeNumber);
+    if ((!normalizedBvid && !hasPgcIdentity) || !normalizedBindingKey) {
+      return null;
+    }
+    return Object.assign({}, record, {
+      sourceType: normalizedSourceType,
+      bvid: normalizedBvid,
+      pgcEpId: normalizedPgcEpId,
+      pgcSeasonId: normalizedPgcSeasonId,
+      pgcEpisodeNumber: normalizedPgcEpisodeNumber,
+      page: normalizedPage,
+      bindingKey: normalizedBindingKey,
+      chainKey: normalizedChainKey,
+      bindingMode: record.bindingMode === "derived" ? "derived" : "explicit",
+      seriesKey: normalizedSeriesKey,
+      anchorEpisode: readPositiveInt(record.anchorEpisode) || null,
+      pageOffset: normalizedPageOffset,
+      episodeOffset: normalizedEpisodeOffset,
+      derivedFromRouteKey: normalizeSpace(record.derivedFromRouteKey || ""),
+      updatedAt: safeNumber(record.updatedAt, Date.now()),
+    });
+  }
+
+  function normalizeBilibiliSeriesRule(rule) {
+    if (!rule || typeof rule !== "object") {
+      return null;
+    }
+    const normalizedBvid = extractBilibiliBvid(rule.bvid || "");
+    const sourceType = rule.sourceType === "pgc" || rule.anchorPgcEpId || rule.pgcEpId || rule.pgcSeasonId ? "pgc" : "video";
+    const anchorEpisode = readPositiveInt(rule.anchorEpisode);
+    if (sourceType === "pgc") {
+      const anchorPgcEpId =
+        readPositiveInt(rule.anchorPgcEpId || rule.pgcEpId) ||
+        extractBilibiliPgcEpId(rule.resolvedUrl || rule.rawInput || "");
+      const pgcSeasonId = readPositiveInt(rule.pgcSeasonId || rule.seasonId) || null;
+      const anchorPgcEpisodeNumber =
+        readPositiveInt(rule.anchorPgcEpisodeNumber || rule.pgcEpisodeNumber || rule.episodeNumber) || null;
+      const episodeOffset = Number.isFinite(Number(rule.episodeOffset))
+        ? Number(rule.episodeOffset)
+        : anchorPgcEpisodeNumber
+        ? anchorPgcEpisodeNumber - anchorEpisode
+        : anchorPgcEpId - anchorEpisode;
+      if (!anchorEpisode || (!anchorPgcEpId && !pgcSeasonId) || !Number.isFinite(episodeOffset)) {
+        return null;
+      }
+      return Object.assign({}, rule, {
+        sourceType,
+        bvid: normalizedBvid,
+        pgcEpId: anchorPgcEpId,
+        anchorPgcEpId,
+        pgcEpisodeNumber: anchorPgcEpisodeNumber,
+        anchorPgcEpisodeNumber,
+        pgcSeasonId,
+        chainKey: normalizeSpace(
+          rule.chainKey || buildBilibiliPgcSeriesChainKey(pgcSeasonId, episodeOffset, anchorPgcEpId)
+        ),
+        anchorEpisode,
+        anchorPage: readPositiveInt(rule.anchorPage) || 1,
+        pageOffset: null,
+        episodeOffset,
+        anchorRouteKey: normalizeSpace(rule.anchorRouteKey || ""),
+        seriesKey: normalizeSpace(rule.seriesKey || ""),
+        title: normalizeSpace(rule.title || ""),
+        normalizedTitleKey: normalizeSpace(rule.normalizedTitleKey || ""),
+        season: safeNumber(rule.season, 1) || 1,
+        updatedAt: safeNumber(rule.updatedAt, Date.now()),
+      });
+    }
+    const anchorPage = readPositiveInt(rule.anchorPage);
+    const normalizedPageOffset = Number.isFinite(Number(rule.pageOffset))
+      ? Number(rule.pageOffset)
+      : anchorPage - anchorEpisode;
+    if (!normalizedBvid || !anchorEpisode || !anchorPage) {
+      return null;
+    }
+    return Object.assign({}, rule, {
+      sourceType,
+      bvid: normalizedBvid,
+      chainKey: normalizeSpace(rule.chainKey || buildBilibiliSeriesChainKey(normalizedBvid, normalizedPageOffset)),
+      anchorEpisode,
+      anchorPage,
+      pageOffset: normalizedPageOffset,
+      episodeOffset: null,
+      anchorRouteKey: normalizeSpace(rule.anchorRouteKey || ""),
+      seriesKey: normalizeSpace(rule.seriesKey || ""),
+      title: normalizeSpace(rule.title || ""),
+      normalizedTitleKey: normalizeSpace(rule.normalizedTitleKey || ""),
+      season: safeNumber(rule.season, 1) || 1,
+      updatedAt: safeNumber(rule.updatedAt, Date.now()),
+    });
+  }
+
+  function normalizeBilibiliImportRecordCollection(value) {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+    let entries = [];
+    if (Array.isArray(value)) {
+      entries = value.map((record, index) => [String(index), record]);
+    } else if (value.bindings && typeof value.bindings === "object") {
+      entries = Object.entries(value.bindings);
+    } else if (isBilibiliImportRecordLike(value)) {
+      entries = [["", value]];
+    } else {
+      entries = Object.entries(value);
+    }
+    const result = {};
+    entries.forEach(([bindingKey, record]) => {
+      const normalized = normalizeBilibiliImportRecord(
+        Object.assign({}, record, {
+          bindingKey: normalizeSpace(record?.bindingKey || bindingKey || ""),
+        })
+      );
+      if (normalized?.bindingKey) {
+        result[normalized.bindingKey] = normalized;
+      }
+    });
+    return result;
+  }
+
+  function normalizeBilibiliSeriesRuleCollection(value, seriesKey = "") {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+    let entries = [];
+    if (Array.isArray(value)) {
+      entries = value.map((rule, index) => [String(index), rule]);
+    } else if (value.chains && typeof value.chains === "object") {
+      entries = Object.entries(value.chains);
+    } else if (isBilibiliSeriesRuleLike(value)) {
+      entries = [["", value]];
+    } else {
+      entries = Object.entries(value);
+    }
+    const result = {};
+    entries.forEach(([chainKey, rule]) => {
+      const normalized = normalizeBilibiliSeriesRule(
+        Object.assign({}, rule, {
+          chainKey: normalizeSpace(rule?.chainKey || chainKey || ""),
+          seriesKey: seriesKey || rule?.seriesKey || "",
+        })
+      );
+      if (normalized?.chainKey) {
+        result[normalized.chainKey] = normalized;
+      }
+    });
+    return result;
+  }
+
+  function sortBilibiliImportRecords(records) {
+    return (Array.isArray(records) ? records.slice() : []).sort((left, right) => {
+      const leftMode = left?.bindingMode === "derived" ? 1 : 0;
+      const rightMode = right?.bindingMode === "derived" ? 1 : 0;
+      if (leftMode !== rightMode) {
+        return leftMode - rightMode;
+      }
+      const updatedDiff = safeNumber(right?.updatedAt, 0) - safeNumber(left?.updatedAt, 0);
+      if (updatedDiff !== 0) {
+        return updatedDiff;
+      }
+      const titleCompare = normalizeSpace(left?.title || "").localeCompare(normalizeSpace(right?.title || ""));
+      if (titleCompare !== 0) {
+        return titleCompare;
+      }
+      const bvidCompare = normalizeSpace(left?.bvid || "").localeCompare(normalizeSpace(right?.bvid || ""));
+      if (bvidCompare !== 0) {
+        return bvidCompare;
+      }
+      const pageDiff = (readPositiveInt(left?.page) || 1) - (readPositiveInt(right?.page) || 1);
+      if (pageDiff !== 0) {
+        return pageDiff;
+      }
+      return normalizeSpace(left?.bindingKey || "").localeCompare(normalizeSpace(right?.bindingKey || ""));
+    });
+  }
+
+  function sortBilibiliSeriesRules(rules) {
+    return (Array.isArray(rules) ? rules.slice() : []).sort((left, right) => {
+      const updatedDiff = safeNumber(right?.updatedAt, 0) - safeNumber(left?.updatedAt, 0);
+      if (updatedDiff !== 0) {
+        return updatedDiff;
+      }
+      const titleCompare = normalizeSpace(left?.title || "").localeCompare(normalizeSpace(right?.title || ""));
+      if (titleCompare !== 0) {
+        return titleCompare;
+      }
+      return normalizeSpace(left?.chainKey || "").localeCompare(normalizeSpace(right?.chainKey || ""));
+    });
+  }
+
+  function pickPrimaryBilibiliImportRecord(records, activeBindingKey = "") {
+    const sorted = sortBilibiliImportRecords(records);
+    const normalizedActiveBindingKey = normalizeSpace(activeBindingKey || "");
+    if (normalizedActiveBindingKey) {
+      const matched = sorted.find((record) => record?.bindingKey === normalizedActiveBindingKey);
+      if (matched) {
+        return matched;
+      }
+    }
+    return sorted[0] || null;
+  }
+
+  function buildDerivedBilibiliImportRecord(rule, routeEntry) {
+    const normalizedRule = normalizeBilibiliSeriesRule(rule);
+    const episodeNumber = readPositiveInt(routeEntry?.episode);
+    if (!normalizedRule || !episodeNumber) {
+      return null;
+    }
+    if (normalizedRule.sourceType === "pgc") {
+      const derivedEpisodeNumber = episodeNumber + normalizedRule.episodeOffset;
+      if (!Number.isFinite(derivedEpisodeNumber) || derivedEpisodeNumber <= 0) {
+        return null;
+      }
+      const derivedEpId =
+        normalizedRule.pgcSeasonId && normalizedRule.anchorPgcEpisodeNumber
+          ? null
+          : readPositiveInt(derivedEpisodeNumber);
+      const resolvedUrl = derivedEpId
+        ? buildBilibiliPgcEpisodeUrl(derivedEpId)
+        : `pgc:season:${normalizedRule.pgcSeasonId}:episode:${readPositiveInt(derivedEpisodeNumber) || 1}`;
+      return normalizeBilibiliImportRecord({
+        sourceType: "pgc",
+        rawInput: resolvedUrl,
+        resolvedUrl,
+        pgcEpId: derivedEpId,
+        pgcSeasonId: normalizedRule.pgcSeasonId,
+        pgcEpisodeNumber: readPositiveInt(derivedEpisodeNumber) || null,
+        page: 1,
+        chainKey: normalizedRule.chainKey,
+        bindingMode: "derived",
+        seriesKey: normalizedRule.seriesKey,
+        anchorEpisode: normalizedRule.anchorEpisode,
+        episodeOffset: normalizedRule.episodeOffset,
+        derivedFromRouteKey: normalizedRule.anchorRouteKey,
+        title: normalizedRule.title,
+      });
+    }
+    const derivedPage = episodeNumber + normalizedRule.pageOffset;
+    if (!Number.isFinite(derivedPage) || derivedPage <= 0) {
+      return null;
+    }
+    const resolvedUrl = buildBilibiliVideoUrl(normalizedRule.bvid, derivedPage);
+    if (!resolvedUrl) {
+      return null;
+    }
+    return normalizeBilibiliImportRecord({
+      rawInput: resolvedUrl,
+      resolvedUrl,
+      bvid: normalizedRule.bvid,
+      page: derivedPage,
+      chainKey: normalizedRule.chainKey,
+      bindingMode: "derived",
+      seriesKey: normalizedRule.seriesKey,
+      anchorEpisode: normalizedRule.anchorEpisode,
+      pageOffset: normalizedRule.pageOffset,
+      derivedFromRouteKey: normalizedRule.anchorRouteKey,
+      title: normalizedRule.title,
+    });
+  }
+
+  function getHeaderValue(rawHeaders, key) {
+    const target = String(key || "").trim().toLowerCase();
+    const lines = String(rawHeaders || "").split(/\r?\n/);
+    for (const line of lines) {
+      const index = line.indexOf(":");
+      if (index <= 0) {
+        continue;
+      }
+      const name = line.slice(0, index).trim().toLowerCase();
+      if (name === target) {
+        return line.slice(index + 1).trim();
+      }
+    }
+    return "";
+  }
+
+  function getUserscriptResponseText(response) {
+    if (typeof response?.responseText === "string") {
+      return response.responseText;
+    }
+    if (typeof response?.response === "string") {
+      return response.response;
+    }
+    return String(response?.response || "");
+  }
+
+  function requestWithUserscript(options, session) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== "function") {
+        reject(new Error("当前 userscript 管理器不支持 GM_xmlhttpRequest"));
+        return;
+      }
+
+      let settled = false;
+      let requestHandle = null;
+      const unregister =
+        typeof session?.registerAbortHandle === "function"
+          ? session.registerAbortHandle(() => {
+              if (requestHandle && typeof requestHandle.abort === "function") {
+                requestHandle.abort();
+              }
+            })
+          : () => {};
+
+      const finish = (callback, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        unregister();
+        callback(value);
+      };
+
+      requestHandle = GM_xmlhttpRequest({
+        method: options.method || "GET",
+        url: options.url,
+        headers: options.headers || {},
+        timeout: safeNumber(options.timeout, 15000),
+        responseType: options.responseType || "text",
+        anonymous: !!options.anonymous,
+        withCredentials: options.anonymous ? false : options.withCredentials !== false,
+        onload: (response) => {
+          if (response?.status >= 200 && response.status < 400) {
+            finish(resolve, response);
+            return;
+          }
+          finish(reject, new Error(`HTTP ${response?.status || 0}`));
+        },
+        ontimeout: () => finish(reject, new Error("请求超时")),
+        onabort: () => {
+          const error = new Error("请求已取消");
+          error.name = "AbortError";
+          finish(reject, error);
+        },
+        onerror: (response) => finish(reject, new Error(response?.error || response?.statusText || "请求失败")),
+      });
+    });
+  }
+
+  function formatBilibiliImportLabel(record) {
+    if (record?.sourceType === "pgc" || record?.pgcEpId || record?.pgcSeasonId) {
+      const epLabel = record?.pgcEpId
+        ? `ep${record.pgcEpId}`
+        : record?.pgcSeasonId && record?.pgcEpisodeNumber
+        ? `ss${record.pgcSeasonId} / 第${record.pgcEpisodeNumber}集`
+        : "番剧 ep";
+      return record?.bvid ? `${epLabel} / ${record.bvid}` : epLabel;
+    }
+    if (!record?.bvid) {
+      return "未导入";
+    }
+    return `${record.bvid} / P${record.page || 1}`;
+  }
+
+  function summarizeBilibiliImportRecords(records, options = {}) {
+    const list = Array.isArray(records) ? records.filter(Boolean) : [];
+    if (!list.length) {
+      return "无";
+    }
+    const limit = Math.max(1, readPositiveInt(options.limit) || 4);
+    const labels = list.slice(0, limit).map((record) => formatBilibiliImportLabel(record));
+    if (list.length > limit) {
+      labels.push(`... 另 ${list.length - limit} 条`);
+    }
+    return labels.join(" + ");
+  }
+
+  function buildBilibiliImportStatusText(importInfo) {
+    const records = Array.isArray(importInfo?.records) ? importInfo.records : [];
+    const counts = importInfo?.counts || {};
+    if (!records.length) {
+      return importInfo?.message || "未导入";
+    }
+    const loadedCount = safeNumber(counts.loaded, 0);
+    const totalCount = safeNumber(counts.total, records.length);
+    const summary =
+      totalCount > 1
+        ? `B站导入 ${totalCount} 条（已加载 ${loadedCount}）`
+        : `B站导入 1 条（已加载 ${loadedCount || 1}）`;
+    if (importInfo?.phase === "error" && importInfo?.message) {
+      return `${summary}\n${importInfo.message}`;
+    }
+    if (totalCount > 1) {
+      return `${summary}\n${summarizeBilibiliImportRecords(records, { limit: 3 })}`;
+    }
+    return importInfo?.message || summary;
+  }
+
+  function summarizeSourceBreakdown(sourceBreakdown) {
+    const entries = Object.entries(sourceBreakdown || {});
+    if (!entries.length) {
+      return "无";
+    }
+    return entries
+      .map(([sourceKey, entry]) => `${entry?.label || sourceKey}: ${safeNumber(entry?.count, 0)} 条`)
+      .join(" + ");
+  }
+
+  function getDanmakuMergeKey(comment) {
+    const time = Math.round(safeNumber(comment?.time, 0) * 1000) / 1000;
+    return [
+      normalizeSpace(comment?.text || ""),
+      MODE_MAP[comment?.mode] || comment?.mode || "rtl",
+      String(comment?.color || "").toLowerCase(),
+      Number.isFinite(time) ? time.toFixed(3) : "0.000",
+    ].join("|");
+  }
+
+  function getDanmakuFuzzyKey(comment) {
+    return [
+      normalizeSpace(comment?.text || ""),
+      MODE_MAP[comment?.mode] || comment?.mode || "rtl",
+    ].join("|");
+  }
+
+  function getDanmakuTimeBucket(time, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
+    const safeWindow = Math.max(0.01, safeNumber(windowSeconds, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS));
+    return Math.round(safeNumber(time, 0) / safeWindow);
+  }
+
+  function hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
+    const fuzzyKey = getDanmakuFuzzyKey(comment);
+    if (!fuzzyKey) {
+      return false;
+    }
+    const bucketMap = priorFuzzyIndex.get(fuzzyKey);
+    if (!bucketMap) {
+      return false;
+    }
+    const commentTime = safeNumber(comment?.time, 0);
+    const centerBucket = getDanmakuTimeBucket(commentTime, windowSeconds);
+    for (let bucket = centerBucket - 1; bucket <= centerBucket + 1; bucket += 1) {
+      const candidates = bucketMap.get(bucket);
+      if (!Array.isArray(candidates) || !candidates.length) {
+        continue;
+      }
+      for (const candidateTime of candidates) {
+        if (Math.abs(candidateTime - commentTime) <= windowSeconds) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function indexCrossSourceFuzzyComment(comment, priorFuzzyIndex, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
+    const fuzzyKey = getDanmakuFuzzyKey(comment);
+    if (!fuzzyKey) {
+      return;
+    }
+    const centerBucket = getDanmakuTimeBucket(comment?.time, windowSeconds);
+    let bucketMap = priorFuzzyIndex.get(fuzzyKey);
+    if (!bucketMap) {
+      bucketMap = new Map();
+      priorFuzzyIndex.set(fuzzyKey, bucketMap);
+    }
+    const candidates = bucketMap.get(centerBucket) || [];
+    candidates.push(safeNumber(comment?.time, 0));
+    bucketMap.set(centerBucket, candidates);
+  }
+
+  function readProtoVarint(bytes, offset) {
+    let result = 0n;
+    let shift = 0n;
+    let cursor = offset;
+    while (cursor < bytes.length) {
+      const byte = BigInt(bytes[cursor]);
+      cursor += 1;
+      result |= (byte & 0x7fn) << shift;
+      if ((byte & 0x80n) === 0n) {
+        return {
+          value: result,
+          offset: cursor,
+        };
+      }
+      shift += 7n;
+    }
+    throw new Error("protobuf varint 解析失败");
+  }
+
+  function protoBigIntToNumber(value, fallback = 0) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  }
+
+  function skipProtoField(bytes, offset, wireType) {
+    if (wireType === 0) {
+      return readProtoVarint(bytes, offset).offset;
+    }
+    if (wireType === 1) {
+      return offset + 8;
+    }
+    if (wireType === 2) {
+      const lengthInfo = readProtoVarint(bytes, offset);
+      return lengthInfo.offset + protoBigIntToNumber(lengthInfo.value, 0);
+    }
+    if (wireType === 3) {
+      let cursor = offset;
+      while (cursor < bytes.length) {
+        const tagInfo = readProtoVarint(bytes, cursor);
+        cursor = tagInfo.offset;
+        const innerWireType = Number(tagInfo.value & 0x07n);
+        if (innerWireType === 4) {
+          return cursor;
+        }
+        cursor = skipProtoField(bytes, cursor, innerWireType);
+      }
+      return cursor;
+    }
+    if (wireType === 4) {
+      return offset;
+    }
+    if (wireType === 5) {
+      return offset + 4;
+    }
+    throw new Error(`不支持的 protobuf wire type: ${wireType}`);
+  }
+
+  function parseBilibiliDmView(responseBuffer) {
+    const bytes = responseBuffer instanceof Uint8Array ? responseBuffer : new Uint8Array(responseBuffer || 0);
+    let segmentDurationMs = 360000;
+    let totalSegments = 0;
+    let totalCount = 0;
+    let offset = 0;
+
+    while (offset < bytes.length) {
+      const tagInfo = readProtoVarint(bytes, offset);
+      offset = tagInfo.offset;
+      const fieldNumber = Number(tagInfo.value >> 3n);
+      const wireType = Number(tagInfo.value & 0x07n);
+
+      if (fieldNumber === 4 && wireType === 2) {
+        const lengthInfo = readProtoVarint(bytes, offset);
+        const endOffset = lengthInfo.offset + protoBigIntToNumber(lengthInfo.value, 0);
+        let innerOffset = lengthInfo.offset;
+        while (innerOffset < endOffset) {
+          const innerTag = readProtoVarint(bytes, innerOffset);
+          innerOffset = innerTag.offset;
+          const innerField = Number(innerTag.value >> 3n);
+          const innerWire = Number(innerTag.value & 0x07n);
+          if (innerWire === 0) {
+            const innerValue = readProtoVarint(bytes, innerOffset);
+            innerOffset = innerValue.offset;
+            if (innerField === 1) {
+              segmentDurationMs = protoBigIntToNumber(innerValue.value, segmentDurationMs);
+            } else if (innerField === 2) {
+              totalSegments = protoBigIntToNumber(innerValue.value, totalSegments);
+            }
+          } else {
+            innerOffset = skipProtoField(bytes, innerOffset, innerWire);
+          }
+        }
+        offset = endOffset;
+        continue;
+      }
+
+      if (fieldNumber === 8 && wireType === 0) {
+        const countInfo = readProtoVarint(bytes, offset);
+        totalCount = protoBigIntToNumber(countInfo.value, totalCount);
+        offset = countInfo.offset;
+        continue;
+      }
+
+      offset = skipProtoField(bytes, offset, wireType);
+    }
+
+    return {
+      segmentDurationMs,
+      totalSegments,
+      totalCount,
+    };
+  }
+
+  function parseBilibiliDmElemMessage(bytes, meta) {
+    const decoder = new TextDecoder("utf-8");
+    let idValue = "";
+    let text = "";
+    let progressMs = 0;
+    let mode = "rtl";
+    let colorValue = 16777215;
+    let ctime = Date.now();
+    let offset = 0;
+
+    while (offset < bytes.length) {
+      const tagInfo = readProtoVarint(bytes, offset);
+      offset = tagInfo.offset;
+      const fieldNumber = Number(tagInfo.value >> 3n);
+      const wireType = Number(tagInfo.value & 0x07n);
+
+      if (wireType === 0) {
+        const valueInfo = readProtoVarint(bytes, offset);
+        offset = valueInfo.offset;
+        const numericValue = protoBigIntToNumber(valueInfo.value, 0);
+        if (fieldNumber === 1) {
+          idValue = valueInfo.value.toString();
+        } else if (fieldNumber === 2) {
+          progressMs = numericValue;
+        } else if (fieldNumber === 3) {
+          mode = MODE_MAP[numericValue] || "rtl";
+        } else if (fieldNumber === 5) {
+          colorValue = numericValue;
+        } else if (fieldNumber === 8) {
+          ctime = numericValue;
+        }
+        continue;
+      }
+
+      if (wireType === 2) {
+        const lengthInfo = readProtoVarint(bytes, offset);
+        const endOffset = lengthInfo.offset + protoBigIntToNumber(lengthInfo.value, 0);
+        const fieldBytes = bytes.slice(lengthInfo.offset, endOffset);
+        offset = endOffset;
+        if (fieldNumber === 7) {
+          text = decoder.decode(fieldBytes);
+        } else if (fieldNumber === 12 && !idValue) {
+          idValue = decoder.decode(fieldBytes);
+        }
+        continue;
+      }
+
+      offset = skipProtoField(bytes, offset, wireType);
+    }
+
+    const normalizedText = normalizeSpace(text);
+    if (!normalizedText) {
+      return null;
+    }
+    return {
+      id: String(idValue || `${meta?.bvid || "bilibili"}-${Math.round(progressMs)}-${normalizedText}`),
+      source: "bilibili",
+      text: normalizedText,
+      time: progressMs / 1000,
+      mode,
+      color: `#${Math.max(0, colorValue).toString(16).slice(-6).padStart(6, "0")}`,
+      date: ctime,
+      episodeId: meta?.sessionEpisodeId ?? meta?.cid ?? null,
+    };
+  }
+
+  function parseBilibiliDmSegment(responseBuffer, meta) {
+    const bytes = responseBuffer instanceof Uint8Array ? responseBuffer : new Uint8Array(responseBuffer || 0);
+    const comments = [];
+    let offset = 0;
+
+    while (offset < bytes.length) {
+      const tagInfo = readProtoVarint(bytes, offset);
+      offset = tagInfo.offset;
+      const fieldNumber = Number(tagInfo.value >> 3n);
+      const wireType = Number(tagInfo.value & 0x07n);
+
+      if (fieldNumber === 1 && wireType === 2) {
+        const lengthInfo = readProtoVarint(bytes, offset);
+        const endOffset = lengthInfo.offset + protoBigIntToNumber(lengthInfo.value, 0);
+        const comment = parseBilibiliDmElemMessage(bytes.slice(lengthInfo.offset, endOffset), meta);
+        if (comment) {
+          comments.push(comment);
+        }
+        offset = endOffset;
+        continue;
+      }
+
+      offset = skipProtoField(bytes, offset, wireType);
+    }
+
+    return comments;
+  }
+
   function normalizeTitle(title) {
     return String(title || "")
       .toLowerCase()
@@ -447,8 +1494,27 @@
     });
   }
 
+  async function mapWithConcurrency(items, concurrency, iteratee) {
+    const list = Array.isArray(items) ? items.slice() : [];
+    if (!list.length) {
+      return [];
+    }
+    const workerCount = Math.max(1, Math.min(list.length, readPositiveInt(concurrency) || 1));
+    const results = new Array(list.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < list.length) {
+        const index = cursor;
+        cursor += 1;
+        results[index] = await iteratee(list[index], index);
+      }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+  }
+
   function getBangumiDataByRoute(route) {
-    const data = window.$data || {};
+    const data = getPageWindow().$data || {};
     return data[`bangumi-${route?.bangumiId}`]?.data || null;
   }
 
@@ -473,6 +1539,92 @@
       contextSource: bangumiTitle ? "bangumiData" : playerInfoTitle ? "playerInfo" : "documentTitleFallback",
       altTitles: Array.isArray(bangumiData?.titles) ? bangumiData.titles.filter(Boolean) : [],
     };
+  }
+
+  function readAniChEpisodeRouteEntries(route) {
+    if (!route?.bangumiId) {
+      return [];
+    }
+
+    const entries = [];
+    const seen = new Set();
+    const addEntry = (entry) => {
+      if (!entry?.routeKey || seen.has(entry.routeKey)) {
+        return;
+      }
+      const episode = readPositiveInt(entry.episode);
+      if (!episode) {
+        return;
+      }
+      seen.add(entry.routeKey);
+      entries.push({
+        routeKey: entry.routeKey,
+        href: entry.href || "",
+        episode,
+      });
+    };
+
+    const routeLinks = Array.from(document.querySelectorAll(`section[episodes] a[href^="/b/${route.bangumiId}/"]`));
+    routeLinks.forEach((link, index) => {
+      const info = makePrimaryRouteInfo(link.getAttribute("href") || "");
+      if (!info || info.bangumiId !== route.bangumiId) {
+        return;
+      }
+      addEntry({
+        routeKey: info.routeKey,
+        href: info.href,
+        episode:
+          extractEpisodeNumber(link.getAttribute("title") || "") ||
+          extractEpisodeNumber(link.textContent || "") ||
+          (routeLinks.length > 1 ? index + 1 : null),
+      });
+    });
+
+    const bangumiStore = getPageWindow().$data?.[`bangumi-${route.bangumiId}`];
+    const storeEpisodes = Array.isArray(bangumiStore?.episodes)
+      ? bangumiStore.episodes
+      : Array.isArray(bangumiStore?.data?.episodes)
+      ? bangumiStore.data.episodes
+      : [];
+    storeEpisodes.forEach((episode, index) => {
+      const hrefCandidate =
+        episode?.href ||
+        episode?.path ||
+        episode?.route ||
+        episode?.url ||
+        episode?.link ||
+        episode?.episodeHref ||
+        episode?.episodePath ||
+        "";
+      const info = makePrimaryRouteInfo(hrefCandidate);
+      if (!info || info.bangumiId !== route.bangumiId) {
+        return;
+      }
+      addEntry({
+        routeKey: info.routeKey,
+        href: info.href,
+        episode:
+          readPositiveInt(episode?.episodeNumber) ||
+          extractEpisodeNumber(episode?.episodeTitle || "") ||
+          extractEpisodeNumber(episode?.title || "") ||
+          extractEpisodeNumber(episode?.name || "") ||
+          (storeEpisodes.length > 1 ? index + 1 : null),
+      });
+    });
+
+    addEntry({
+      routeKey: route.routeKey,
+      href: route.href || location.href,
+      episode:
+        extractEpisodeNumber(
+          getNormalizedText("section[player-info] section[item='本集标题']") ||
+            document.querySelector("a[aria-current='page'][item][title]")?.getAttribute("title") ||
+            ""
+        ) || null,
+    });
+
+    entries.sort((left, right) => left.episode - right.episode);
+    return entries;
   }
 
   function cleanFileNameNoise(name) {
@@ -885,6 +2037,24 @@
     }
   }
 
+  function makePrimaryRouteInfo(href) {
+    try {
+      const url = new URL(href || location.href, location.href);
+      const match = url.pathname.match(PRIMARY_ROUTE_RE);
+      if (!match) {
+        return null;
+      }
+      return {
+        bangumiId: Number(match[1]),
+        episodeRouteId: Number(match[2]),
+        routeKey: url.pathname,
+        href: url.href,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   function installStyles() {
     if (document.getElementById(STYLE_ID)) {
       return;
@@ -1075,6 +2245,143 @@
 
       .anich-ddm-toolbar.is-dragging .anich-ddm-toolbar-label {
         cursor: grabbing;
+      }
+
+      .anich-ddm-import-popover {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        z-index: 2147483646;
+        width: min(21rem, calc(100vw - 2rem));
+        color: #eef2f7;
+        background: rgba(8, 13, 21, 0.96);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+        backdrop-filter: blur(18px);
+        padding: 12px;
+        display: grid;
+        gap: 10px;
+        opacity: 0;
+        visibility: hidden;
+        transform: translate3d(0, 8px, 0);
+        transition: opacity 0.16s ease, transform 0.16s ease, visibility 0s linear 0.16s;
+        pointer-events: none;
+      }
+
+      .anich-ddm-import-popover.is-open {
+        opacity: 1;
+        visibility: visible;
+        transform: translate3d(0, 0, 0);
+        transition-delay: 0s;
+        pointer-events: auto;
+      }
+
+      .anich-ddm-import-head {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .anich-ddm-import-title {
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+      }
+
+      .anich-ddm-import-note {
+        font-size: 11px;
+        opacity: 0.72;
+      }
+
+      .anich-ddm-import-actions {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .anich-ddm-import-status {
+        font-size: 11px;
+        line-height: 1.5;
+        color: rgba(170, 224, 255, 0.94);
+        white-space: pre-line;
+      }
+
+      .anich-ddm-import-status.is-error {
+        color: #ffb9c0;
+      }
+
+      .anich-ddm-import-summary {
+        padding: 10px 11px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        display: grid;
+        gap: 8px;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+
+      .anich-ddm-import-summary-head {
+        color: rgba(220, 232, 244, 0.84);
+      }
+
+      .anich-ddm-import-list {
+        display: grid;
+        gap: 8px;
+        max-height: 18rem;
+        overflow: auto;
+        padding-right: 2px;
+      }
+
+      .anich-ddm-import-item {
+        display: grid;
+        gap: 6px;
+        padding: 9px 10px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .anich-ddm-import-item-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .anich-ddm-import-item-title {
+        font-size: 11px;
+        font-weight: 700;
+        line-height: 1.4;
+      }
+
+      .anich-ddm-import-item-remove {
+        flex: none;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.04);
+        color: rgba(244, 249, 255, 0.92);
+        font-size: 11px;
+        cursor: pointer;
+      }
+
+      .anich-ddm-import-item-remove:hover {
+        border-color: rgba(129, 207, 255, 0.48);
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .anich-ddm-import-item-meta {
+        font-size: 11px;
+        line-height: 1.45;
+        color: rgba(224, 233, 242, 0.84);
+        white-space: pre-line;
+      }
+
+      .anich-ddm-import-empty {
+        color: rgba(220, 232, 244, 0.68);
       }
 
       .anich-ddm-panel {
@@ -1677,40 +2984,349 @@
     }
   }
 
-  class DanmakuStore {
-    constructor() {
-      this.clear();
+  class BilibiliTransport {
+    constructor(app) {
+      this.app = app;
     }
 
-    clear() {
+    buildHeaders(target, accept = "*/*") {
+      const bvid = extractBilibiliBvid(target || "");
+      const pgcEpId = extractBilibiliPgcEpId(target || "") || readPositiveInt(target);
+      const referer = bvid
+        ? `https://www.bilibili.com/video/${bvid}/`
+        : pgcEpId
+        ? buildBilibiliPgcEpisodeUrl(pgcEpId)
+        : "https://www.bilibili.com/";
+      return {
+        Accept: accept,
+        Origin: "https://www.bilibili.com",
+        Referer: referer,
+      };
+    }
+
+    async resolveShortLink(url, session) {
+      const response = await requestWithUserscript(
+        {
+          url,
+          headers: this.buildHeaders("", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        },
+        session
+      );
+      const finalUrl =
+        normalizeSpace(response?.finalUrl || "") ||
+        normalizeSpace(getHeaderValue(response?.responseHeaders, "location")) ||
+        normalizeSpace(url);
+      return finalUrl;
+    }
+
+    async resolveVideoMeta(bvid, session) {
+      const url = `${BILIBILI_API}/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`;
+      const response = await requestWithUserscript(
+        {
+          url,
+          headers: this.buildHeaders(bvid, "application/json"),
+        },
+        session
+      );
+      const payload = JSON.parse(getUserscriptResponseText(response) || "{}");
+      if (safeNumber(payload?.code, -1) !== 0 || !payload?.data) {
+        throw new Error(payload?.message || "B 站视频信息请求失败");
+      }
+      const pages = Array.isArray(payload.data.pages) ? payload.data.pages : [];
+      const resolvedBvid = extractBilibiliBvid(String(payload.data.bvid || bvid || ""));
+      return {
+        sourceType: "video",
+        bvid: resolvedBvid,
+        aid: safeNumber(payload.data.aid, 0),
+        title: normalizeSpace(payload.data.title || ""),
+        cid: safeNumber(payload.data.cid, 0),
+        duration: safeNumber(payload.data.duration, 0),
+        totalDanmakuCount: safeNumber(payload?.data?.stat?.danmaku, 0),
+        pages,
+        resolvedUrl: `https://www.bilibili.com/video/${resolvedBvid}/`,
+      };
+    }
+
+    async resolvePgcEpisodeMeta(target, session) {
+      const normalizedEpId = readPositiveInt(
+        typeof target === "object" ? target?.pgcEpId || target?.epId : target
+      );
+      const targetSeasonId = readPositiveInt(
+        typeof target === "object" ? target?.pgcSeasonId || target?.seasonId : null
+      );
+      const targetEpisodeNumber = readPositiveInt(
+        typeof target === "object" ? target?.pgcEpisodeNumber || target?.episodeNumber : null
+      );
+      if (!normalizedEpId && (!targetSeasonId || !targetEpisodeNumber)) {
+        throw new Error("缺少有效的 B 站番剧 ep 号或 season/集号");
+      }
+      const url = normalizedEpId
+        ? `${BILIBILI_API}/pgc/view/web/season?ep_id=${encodeURIComponent(normalizedEpId)}`
+        : `${BILIBILI_API}/pgc/view/web/season?season_id=${encodeURIComponent(targetSeasonId)}`;
+      const response = await requestWithUserscript(
+        {
+          url,
+          headers: this.buildHeaders(normalizedEpId ? `ep${normalizedEpId}` : "", "application/json"),
+        },
+        session
+      );
+      const payload = JSON.parse(getUserscriptResponseText(response) || "{}");
+      if (safeNumber(payload?.code, -1) !== 0 || !payload?.result) {
+        throw new Error(
+          payload?.message ||
+            (normalizedEpId
+              ? `B 站番剧 ep${normalizedEpId} 信息请求失败`
+              : `B 站番剧 season ${targetSeasonId} 信息请求失败`)
+        );
+      }
+      const result = payload.result || {};
+      const episodes = Array.isArray(result.episodes) ? result.episodes : [];
+      const episode = episodes.find(
+        (item) =>
+          (normalizedEpId &&
+            (readPositiveInt(item?.id || item?.ep_id) === normalizedEpId ||
+              extractBilibiliPgcEpId(item?.link || item?.share_url || "") === normalizedEpId)) ||
+          (!normalizedEpId && readBilibiliPgcEpisodeNumber(item) === targetEpisodeNumber)
+      );
+      if (!episode) {
+        throw new Error(
+          normalizedEpId
+            ? `未找到 ep${normalizedEpId} 对应的 B 站番剧分集`
+            : `未找到 season ${targetSeasonId} 第${targetEpisodeNumber}集对应的 B 站番剧分集`
+        );
+      }
+      const resolvedEpId = readPositiveInt(episode.id || episode.ep_id) || normalizedEpId;
+      const episodeNumber = readBilibiliPgcEpisodeNumber(episode);
+      const resolvedBvid = extractBilibiliBvid(String(episode.bvid || ""));
+      const cid = safeNumber(episode.cid, 0);
+      const aid = safeNumber(episode.aid, 0);
+      if (!resolvedBvid || !cid || !aid) {
+        throw new Error(`ep${normalizedEpId} 缺少可用的 B 站弹幕参数`);
+      }
+      const durationRaw = safeNumber(episode.duration, 0);
+      const durationSeconds = durationRaw > 10000 ? durationRaw / 1000 : durationRaw;
+      const partTitle = normalizeSpace(
+        [episode.title ? `第${episode.title}集` : "", episode.long_title || episode.show_title || ""]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const seasonTitle = normalizeSpace(result.title || result.season_title || "");
+      return {
+        sourceType: "pgc",
+        pgcEpId: resolvedEpId,
+        pgcSeasonId: readPositiveInt(result.season_id) || null,
+        pgcEpisodeNumber: episodeNumber,
+        bvid: resolvedBvid,
+        aid,
+        title: normalizeSpace([seasonTitle, partTitle].filter(Boolean).join(" / ")) || partTitle || seasonTitle,
+        cid,
+        duration: durationSeconds,
+        totalDanmakuCount: safeNumber(episode?.stat?.danmakus || episode?.stat_for_unity?.danmaku?.value, 0),
+        pages: [
+          {
+            page: 1,
+            cid,
+            duration: durationSeconds,
+            part: partTitle || `ep${normalizedEpId}`,
+          },
+        ],
+        resolvedUrl: buildBilibiliPgcEpisodeUrl(resolvedEpId),
+      };
+    }
+
+    pickCid(pages, page) {
+      const candidates = Array.isArray(pages) ? pages : [];
+      if (!candidates.length) {
+        throw new Error("B 站视频没有可用分 P");
+      }
+      const requestedPage = readPositiveInt(page) || 1;
+      const matched = candidates.find((item) => safeNumber(item?.page, 0) === requestedPage);
+      if (!matched) {
+        throw new Error(`未找到 P${requestedPage}，请检查链接中的分 P 参数`);
+      }
+      return {
+        page: safeNumber(matched.page, requestedPage),
+        cid: safeNumber(matched.cid, 0),
+        duration: safeNumber(matched.duration, 0),
+        part: normalizeSpace(matched.part || ""),
+      };
+    }
+
+    async fetchDmView(oid, pid, bvid, session) {
+      if (!safeNumber(oid, 0)) {
+        throw new Error("缺少有效的 cid，无法读取弹幕分段信息");
+      }
+      const response = await requestWithUserscript(
+        {
+          url: `${BILIBILI_API}/x/v2/dm/web/view?type=1&oid=${encodeURIComponent(oid)}${pid ? `&pid=${encodeURIComponent(pid)}` : ""}`,
+          headers: this.buildHeaders(bvid, "*/*"),
+          responseType: "arraybuffer",
+        },
+        session
+      );
+      return parseBilibiliDmView(response?.response);
+    }
+
+    async fetchDmSegment(cid, segmentIndex, bvid, session) {
+      if (!safeNumber(cid, 0)) {
+        throw new Error("缺少有效的 cid，无法加载 B 站弹幕分段");
+      }
+      const response = await requestWithUserscript(
+        {
+          url: `${BILIBILI_API}/x/v2/dm/web/seg.so?type=1&oid=${encodeURIComponent(cid)}&segment_index=${encodeURIComponent(segmentIndex)}`,
+          headers: this.buildHeaders(bvid, "*/*"),
+          responseType: "arraybuffer",
+        },
+        session
+      );
+      return parseBilibiliDmSegment(response?.response, {
+        bvid,
+        cid,
+      });
+    }
+
+    async fetchDmSegmentWithRetry(cid, segmentIndex, bvid, session) {
+      let lastError = null;
+      for (let attempt = 0; attempt <= BILIBILI_DM_SEGMENT_RETRY_COUNT; attempt += 1) {
+        try {
+          return await this.fetchDmSegment(cid, segmentIndex, bvid, session);
+        } catch (error) {
+          lastError = error;
+          if (attempt >= BILIBILI_DM_SEGMENT_RETRY_COUNT || session?.destroyed) {
+            break;
+          }
+          await sleep(160 * (attempt + 1));
+        }
+      }
+      throw new Error(`第 ${segmentIndex} 段弹幕加载失败：${lastError?.message || lastError || "未知错误"}`);
+    }
+
+    async fetchSegmentedDanmaku(meta, session) {
+      const viewData = await this.fetchDmView(meta.cid, meta.aid, meta.bvid, session);
+      const segmentDurationMs = Math.max(1000, safeNumber(viewData.segmentDurationMs, 360000));
+      const fallbackDurationMs = Math.max(
+        safeNumber(meta.partDuration, 0) * 1000,
+        safeNumber(meta.duration, 0) * 1000
+      );
+      const fallbackSegments = Math.max(1, Math.ceil(fallbackDurationMs / segmentDurationMs));
+      const totalSegments = Math.max(1, safeNumber(viewData.totalSegments, 0) || fallbackSegments);
+      const segmentIndexes = Array.from({ length: totalSegments }, (_, index) => index + 1);
+      const segments = await mapWithConcurrency(
+        segmentIndexes,
+        BILIBILI_DM_SEGMENT_CONCURRENCY,
+        (segmentIndex) => this.fetchDmSegmentWithRetry(meta.cid, segmentIndex, meta.bvid, session)
+      );
+      return {
+        comments: segments.flat().map((comment) =>
+          Object.assign({}, comment, {
+            episodeId: meta?.sessionEpisodeId ?? meta?.cid ?? null,
+          })
+        ),
+        viewData,
+      };
+    }
+  }
+
+  class DanmakuStore {
+    constructor() {
+      this.clearAll();
+    }
+
+    clearAll() {
+      this.sources = new Map();
       this.items = [];
-      this.ids = new Set();
       this.stats = {
         count: 0,
         visibleCount: 0,
         filteredCount: 0,
         source: "",
         episodeId: null,
+        sourceBreakdown: {},
       };
     }
 
-    replace(comments, match, sourceName) {
-      this.clear();
-      for (const comment of comments) {
-        const uniqueId = comment.id || `${comment.source}:${comment.text}:${round1(comment.time)}:${comment.color}`;
-        if (this.ids.has(uniqueId)) {
-          continue;
-        }
-        this.ids.add(uniqueId);
-        this.items.push(comment);
+    clear() {
+      this.clearAll();
+    }
+
+    hasSource(sourceKey) {
+      return this.sources.has(sourceKey);
+    }
+
+    replaceSource(sourceKey, comments, meta) {
+      this.sources.set(sourceKey, {
+        comments: Array.isArray(comments) ? comments.slice() : [],
+        meta: Object.assign({}, meta),
+      });
+      this.rebuild();
+    }
+
+    removeSource(sourceKey) {
+      if (this.sources.delete(sourceKey)) {
+        this.rebuild();
       }
-      this.items.sort((left, right) => left.time - right.time);
+    }
+
+    rebuild() {
+      const ids = new Set();
+      const merged = [];
+      const sourceBreakdown = {};
+      const priorFuzzyIndex = new Map();
+      let sourceLabels = [];
+      let episodeId = null;
+
+      let sourceIndex = 0;
+      for (const [sourceKey, bucket] of this.sources.entries()) {
+        const bucketComments = Array.isArray(bucket?.comments)
+          ? bucket.comments
+              .slice()
+              .sort((left, right) => safeNumber(left?.time, 0) - safeNumber(right?.time, 0))
+          : [];
+        const meta = bucket?.meta || {};
+        sourceBreakdown[sourceKey] = {
+          count: bucketComments.length,
+          label: meta.label || sourceKey,
+          source: meta.source || sourceKey,
+          sourceType: meta.sourceType || "",
+          bvid: meta.bvid || "",
+          pgcEpId: safeNumber(meta.pgcEpId, 0) || 0,
+          pgcSeasonId: safeNumber(meta.pgcSeasonId, 0) || 0,
+          page: safeNumber(meta.page, 0) || 0,
+          availableCount: safeNumber(meta.availableCount, 0) || 0,
+          totalCount: safeNumber(meta.totalCount, 0) || 0,
+          segmentCount: safeNumber(meta.segmentCount, 0) || 0,
+        };
+        sourceLabels.push(meta.label || sourceKey);
+        if (episodeId == null && meta.episodeId != null) {
+          episodeId = meta.episodeId;
+        }
+        const acceptedComments = [];
+        for (const comment of bucketComments) {
+          const uniqueId = getDanmakuMergeKey(comment);
+          if (ids.has(uniqueId)) {
+            continue;
+          }
+          if (sourceIndex > 0 && hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex)) {
+            continue;
+          }
+          ids.add(uniqueId);
+          merged.push(comment);
+          acceptedComments.push(comment);
+        }
+        for (const comment of acceptedComments) {
+          indexCrossSourceFuzzyComment(comment, priorFuzzyIndex);
+        }
+        sourceIndex += 1;
+      }
+      merged.sort((left, right) => left.time - right.time);
+      this.items = merged;
       this.stats = {
-        count: this.items.length,
-        visibleCount: this.items.length,
+        count: merged.length,
+        visibleCount: merged.length,
         filteredCount: 0,
-        source: sourceName || "",
-        episodeId: match?.episodeId || null,
+        source: sourceLabels.filter(Boolean).join(" + "),
+        episodeId,
+        sourceBreakdown,
       };
     }
 
@@ -1942,8 +3558,10 @@
       this.closeTimer = 0;
       this.countdownTimer = 0;
       this.deadlineAt = 0;
+      this.remainingMs = 0;
       this.activeCue = null;
       this.visible = false;
+      this.paused = false;
       this.state = {
         visible: false,
         shownAt: 0,
@@ -1952,8 +3570,11 @@
         targetLabel: "",
         targetTime: null,
         remainingSeconds: 0,
+        paused: false,
       };
       this.handleClick = this.handleClick.bind(this);
+      this.handleMouseEnter = this.handleMouseEnter.bind(this);
+      this.handleMouseLeave = this.handleMouseLeave.bind(this);
     }
 
     attach(container) {
@@ -1975,6 +3596,8 @@
       this.button.type = "button";
       this.button.disabled = true;
       this.button.addEventListener("click", this.handleClick);
+      this.button.addEventListener("mouseenter", this.handleMouseEnter);
+      this.button.addEventListener("mouseleave", this.handleMouseLeave);
       this.eyebrow = createElement("div", "anich-ddm-skip-eyebrow", "检测到空降");
       this.title = createElement("div", "anich-ddm-skip-title", "点击跳转");
       this.meta = createElement("div", "anich-ddm-skip-meta", "");
@@ -1987,6 +3610,8 @@
       this.clearTimer();
       if (this.button) {
         this.button.removeEventListener("click", this.handleClick);
+        this.button.removeEventListener("mouseenter", this.handleMouseEnter);
+        this.button.removeEventListener("mouseleave", this.handleMouseLeave);
       }
       if (this.root?.isConnected) {
         this.root.remove();
@@ -1999,7 +3624,7 @@
       this.visible = false;
     }
 
-    clearTimer() {
+    clearTimer(resetDeadline = true) {
       if (this.closeTimer) {
         clearTimeout(this.closeTimer);
         this.closeTimer = 0;
@@ -2008,16 +3633,60 @@
         clearInterval(this.countdownTimer);
         this.countdownTimer = 0;
       }
-      this.deadlineAt = 0;
+      if (resetDeadline) {
+        this.deadlineAt = 0;
+      }
     }
 
     updateCountdownText() {
       if (!this.meta || !this.activeCue) {
         return;
       }
-      const remainingSeconds = Math.max(0, Math.ceil((this.deadlineAt - Date.now()) / 1000));
+      const remainingMs = this.paused ? this.remainingMs : Math.max(0, this.deadlineAt - Date.now());
+      const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
       this.meta.textContent = `跳转至 ${this.activeCue.targetLabel} · 剩余 ${remainingSeconds} 秒`;
       this.state.remainingSeconds = remainingSeconds;
+    }
+
+    startCountdown() {
+      if (!this.activeCue) {
+        return;
+      }
+      const durationMs = Math.max(0, Math.round(this.remainingMs));
+      this.deadlineAt = Date.now() + durationMs;
+      this.updateCountdownText();
+      if (durationMs <= 0) {
+        this.session.scheduler.handleSkipPromptTimeout();
+        this.dismiss("timeout");
+        return;
+      }
+      this.countdownTimer = window.setInterval(() => {
+        this.updateCountdownText();
+      }, 250);
+      this.closeTimer = window.setTimeout(() => {
+        this.session.scheduler.handleSkipPromptTimeout();
+        this.dismiss("timeout");
+      }, durationMs);
+    }
+
+    handleMouseEnter() {
+      if (!this.visible || this.paused || !this.activeCue) {
+        return;
+      }
+      this.remainingMs = Math.max(0, this.deadlineAt - Date.now());
+      this.paused = true;
+      this.state.paused = true;
+      this.clearTimer(false);
+      this.updateCountdownText();
+    }
+
+    handleMouseLeave() {
+      if (!this.visible || !this.paused || !this.activeCue) {
+        return;
+      }
+      this.paused = false;
+      this.state.paused = false;
+      this.startCountdown();
     }
 
     show(skipCue) {
@@ -2032,7 +3701,8 @@
       }
       this.clearTimer();
       this.activeCue = Object.assign({}, skipCue);
-      this.deadlineAt = Date.now() + SKIP_PROMPT_DURATION_MS;
+      this.remainingMs = SKIP_PROMPT_DURATION_MS;
+      this.paused = false;
       this.title.textContent = "点击跳过片头";
       this.button.title = `跳转至 ${skipCue.targetLabel}`;
       this.button.disabled = false;
@@ -2047,15 +3717,9 @@
         targetLabel: skipCue.targetLabel || "",
         targetTime: safeNumber(skipCue.targetTime, null),
         remainingSeconds: Math.ceil(SKIP_PROMPT_DURATION_MS / 1000),
+        paused: false,
       };
-      this.updateCountdownText();
-      this.countdownTimer = window.setInterval(() => {
-        this.updateCountdownText();
-      }, 250);
-      this.closeTimer = window.setTimeout(() => {
-        this.session.scheduler.handleSkipPromptTimeout();
-        this.dismiss("timeout");
-      }, SKIP_PROMPT_DURATION_MS);
+      this.startCountdown();
     }
 
     dismiss(reason = "dismissed") {
@@ -2068,9 +3732,12 @@
         this.button.disabled = true;
       }
       this.visible = false;
+      this.paused = false;
+      this.remainingMs = 0;
       this.state.visible = false;
       this.state.lastAction = reason;
       this.state.remainingSeconds = 0;
+      this.state.paused = false;
       if (reason === "reset" || reason === "rearm" || reason === "destroy") {
         this.activeCue = null;
       }
@@ -2102,6 +3769,7 @@
         targetLabel: this.state.targetLabel,
         targetTime: this.state.targetTime,
         remainingSeconds: this.state.remainingSeconds,
+        paused: this.state.paused,
       };
     }
 
@@ -2118,6 +3786,7 @@
         targetLabel: "",
         targetTime: null,
         remainingSeconds: 0,
+        paused: false,
       };
     }
   }
@@ -2410,6 +4079,13 @@
       this.currentResults = [];
       this.settingsEntry = null;
       this.toggleEntry = null;
+      this.importPopover = null;
+      this.importInput = null;
+      this.importStatus = null;
+      this.importSummary = null;
+      this.importApplyButton = null;
+      this.importClearButton = null;
+      this.importCloseTimer = 0;
       this.hostInlineStyles = null;
       this.toolbarPosition = normalizeToolbarPosition(storageGet(TOOLBAR_POSITION_KEY, DEFAULT_TOOLBAR_POSITION));
       this.dragState = null;
@@ -2419,6 +4095,9 @@
       this.handleToolbarPointerMove = this.handleToolbarPointerMove.bind(this);
       this.handleToolbarPointerUp = this.handleToolbarPointerUp.bind(this);
       this.handleViewportChange = this.handleViewportChange.bind(this);
+      this.handleSettingsPointerEnter = this.handleSettingsPointerEnter.bind(this);
+      this.handleImportPopoverPointerEnter = this.handleImportPopoverPointerEnter.bind(this);
+      this.handleImportPopoverPointerLeave = this.handleImportPopoverPointerLeave.bind(this);
       window.addEventListener("resize", this.handleViewportChange, true);
     }
 
@@ -2429,6 +4108,7 @@
 
       const panelWasOpen = !!this.panel?.classList.contains("is-open");
       const matcherWasOpen = !!this.matcher?.classList.contains("is-open");
+      const importWasOpen = !!this.importPopover?.classList.contains("is-open");
       this.playerContainer = playerContainer;
       this.overlay = overlay;
       const nextToolbarHost = this.resolveToolbarHost(playerContainer);
@@ -2455,6 +4135,15 @@
           this.panel.classList.add("is-open");
         }
       }
+      if (!this.importPopover?.isConnected || this.importPopover.parentElement !== this.toolbarHost) {
+        if (this.importPopover?.isConnected) {
+          this.importPopover.remove();
+        }
+        this.buildImportPopover(this.toolbarHost);
+        if (importWasOpen) {
+          this.importPopover.classList.add("is-open");
+        }
+      }
       if (!this.matcher?.isConnected || this.matcher.parentElement !== overlay) {
         if (this.matcher?.isConnected) {
           this.matcher.remove();
@@ -2472,6 +4161,7 @@
       document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
       window.removeEventListener("resize", this.handleViewportChange, true);
       this.stopToolbarDrag(false);
+      this.clearImportPopoverCloseTimer();
       if (this.toolbar?.isConnected) {
         this.toolbar.remove();
       }
@@ -2479,6 +4169,15 @@
       this.toolbarHandle = null;
       this.settingsEntry = null;
       this.toggleEntry = null;
+      if (this.importPopover?.isConnected) {
+        this.importPopover.remove();
+      }
+      this.importPopover = null;
+      this.importInput = null;
+      this.importStatus = null;
+      this.importSummary = null;
+      this.importApplyButton = null;
+      this.importClearButton = null;
       if (this.panel?.isConnected) {
         this.panel.remove();
       }
@@ -2593,6 +4292,7 @@
         this.toolbar.style.transform = "translate3d(calc(100% + 12px), 0, 0)";
       }
       this.applyPanelPosition();
+      this.applyImportPopoverPosition();
       if (persist && changed) {
         this.saveToolbarPosition();
       }
@@ -2639,6 +4339,84 @@
       this.panel.style.top = `${clampedTop}px`;
     }
 
+    applyImportPopoverPosition() {
+      if (!this.importPopover || !this.settingsEntry) {
+        return;
+      }
+      const anchorRect = this.settingsEntry.getBoundingClientRect();
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1280;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 720;
+      const margin = 16;
+      const gap = 10;
+      const popoverRect = this.importPopover.getBoundingClientRect();
+      const popoverWidth = Math.min(popoverRect.width || 336, Math.max(0, viewportWidth - margin * 2));
+      const popoverHeight = Math.min(popoverRect.height || 196, Math.max(0, viewportHeight - margin * 2));
+      const preferredSide = this.toolbarPosition.side === "right" ? "left" : "right";
+      const availableLeft = anchorRect.left - gap - margin;
+      const availableRight = viewportWidth - margin - (anchorRect.right + gap);
+      let placeSide = preferredSide;
+
+      if (preferredSide === "left") {
+        if (availableLeft < popoverWidth && availableRight >= popoverWidth) {
+          placeSide = "right";
+        }
+      } else if (availableRight < popoverWidth && availableLeft >= popoverWidth) {
+        placeSide = "left";
+      }
+
+      const desiredLeft =
+        placeSide === "right" ? anchorRect.right + gap : anchorRect.left - gap - popoverWidth;
+      const maxLeft = Math.max(margin, viewportWidth - margin - popoverWidth);
+      const desiredTop = anchorRect.top + anchorRect.height / 2 - popoverHeight / 2;
+      const maxTop = Math.max(margin, viewportHeight - margin - popoverHeight);
+
+      this.importPopover.style.left = `${clamp(Math.round(desiredLeft), margin, maxLeft)}px`;
+      this.importPopover.style.top = `${clamp(Math.round(desiredTop), margin, maxTop)}px`;
+    }
+
+    clearImportPopoverCloseTimer() {
+      if (this.importCloseTimer) {
+        window.clearTimeout(this.importCloseTimer);
+        this.importCloseTimer = 0;
+      }
+    }
+
+    openImportPopover() {
+      if (!this.importPopover) {
+        return;
+      }
+      this.clearImportPopoverCloseTimer();
+      this.importPopover.classList.add("is-open");
+      this.applyImportPopoverPosition();
+    }
+
+    closeImportPopover(immediate = false) {
+      if (!this.importPopover) {
+        return;
+      }
+      this.clearImportPopoverCloseTimer();
+      if (immediate) {
+        this.importPopover.classList.remove("is-open");
+        return;
+      }
+      this.importCloseTimer = window.setTimeout(() => {
+        this.importPopover?.classList.remove("is-open");
+        this.importCloseTimer = 0;
+      }, IMPORT_POPOVER_CLOSE_DELAY_MS);
+    }
+
+    handleSettingsPointerEnter() {
+      this.openImportPopover();
+    }
+
+    handleImportPopoverPointerEnter() {
+      this.clearImportPopoverCloseTimer();
+    }
+
+    handleImportPopoverPointerLeave() {
+      this.closeImportPopover(false);
+    }
+
     buildToolbar(parent) {
       this.toolbar = createElement("div", "anich-ddm-toolbar");
       this.toolbar.dataset.anichDdmToolbar = "true";
@@ -2658,12 +4436,75 @@
       settingsButton.innerHTML = createControlIcon("settings");
       settingsButton.setAttribute("aria-label", "弹幕设置");
       settingsButton.addEventListener("click", this.handleToolbarClick);
+      settingsButton.addEventListener("pointerenter", this.handleSettingsPointerEnter);
+      settingsButton.addEventListener("pointerleave", this.handleImportPopoverPointerLeave);
 
       this.toolbarHandle = label;
       this.settingsEntry = settingsButton;
       this.toggleEntry = toggleButton;
       this.toolbar.append(label, toggleButton, settingsButton);
       parent.appendChild(this.toolbar);
+    }
+
+    buildImportPopover(parent) {
+      this.importPopover = createElement("div", "anich-ddm-import-popover");
+      this.importPopover.addEventListener("pointerenter", this.handleImportPopoverPointerEnter);
+      this.importPopover.addEventListener("pointerleave", this.handleImportPopoverPointerLeave);
+
+      const head = createElement("div", "anich-ddm-import-head");
+      head.append(
+        createElement("div", "anich-ddm-import-title", "导入 B 站弹幕"),
+        createElement("div", "anich-ddm-import-note", "支持 BV、普通视频链接、番剧 ep 链接和 b23 短链")
+      );
+
+      const actions = createElement("div", "anich-ddm-import-actions");
+      this.importInput = createElement("input", "anich-ddm-input");
+      this.importInput.placeholder = "输入 BV、视频链接或 https://www.bilibili.com/bangumi/play/ep...";
+      this.importInput.addEventListener("keydown", async (event) => {
+        if (event.key !== "Enter") {
+          return;
+        }
+        event.preventDefault();
+        if (this.importApplyButton?.disabled) {
+          return;
+        }
+        this.importApplyButton.disabled = true;
+        try {
+          await this.session.importBilibiliFromInput(this.importInput.value);
+        } finally {
+          this.importApplyButton.disabled = false;
+          this.update();
+        }
+      });
+
+      this.importApplyButton = createElement("button", "anich-ddm-button", "导入");
+      this.importApplyButton.type = "button";
+      this.importApplyButton.addEventListener("click", async () => {
+        this.importApplyButton.disabled = true;
+        try {
+          await this.session.importBilibiliFromInput(this.importInput.value);
+        } finally {
+          this.importApplyButton.disabled = false;
+          this.update();
+        }
+      });
+
+      this.importClearButton = createElement("button", "anich-ddm-button", "清除");
+      this.importClearButton.type = "button";
+      this.importClearButton.addEventListener("click", () => {
+        this.session.clearBilibiliImport(true);
+        if (this.importInput) {
+          this.importInput.value = "";
+        }
+        this.update();
+      });
+
+      actions.append(this.importInput, this.importApplyButton, this.importClearButton);
+
+      this.importStatus = createElement("div", "anich-ddm-import-status", "未导入");
+      this.importSummary = createElement("div", "anich-ddm-import-summary");
+      this.importPopover.append(head, actions, this.importStatus, this.importSummary);
+      parent.appendChild(this.importPopover);
     }
 
     buildPanel(parent) {
@@ -2962,10 +4803,16 @@
 
     handleDocumentPointerDown(event) {
       const target = event.target;
-      if (this.panel?.contains(target) || this.matcher?.contains(target) || this.toolbar?.contains(target)) {
+      if (
+        this.panel?.contains(target) ||
+        this.matcher?.contains(target) ||
+        this.toolbar?.contains(target) ||
+        this.importPopover?.contains(target)
+      ) {
         return;
       }
       this.closePanel();
+      this.closeImportPopover(true);
     }
 
     handleToolbarClick(event) {
@@ -2973,6 +4820,7 @@
       event.preventDefault();
       event.stopPropagation();
       if (role === "settings") {
+        this.closeImportPopover(true);
         this.togglePanel();
         return;
       }
@@ -3101,6 +4949,111 @@
         chip.appendChild(removeButton);
         listNode.appendChild(chip);
       });
+    }
+
+    renderImportSummary(importInfo) {
+      if (!this.importSummary) {
+        return;
+      }
+      this.importSummary.textContent = "";
+      const records = Array.isArray(importInfo.records) ? importInfo.records : [];
+      const failedRecord =
+        importInfo.phase === "error" &&
+        importInfo.record &&
+        !records.some((record) => record.bindingKey === importInfo.record.bindingKey)
+          ? importInfo.record
+          : null;
+      if (!records.length) {
+        if (failedRecord) {
+          this.importSummary.appendChild(
+            createElement(
+              "div",
+              "anich-ddm-import-item-meta",
+              `最近失败: ${formatBilibiliImportLabel(failedRecord)}\n错误: ${importInfo.error || importInfo.message || "未知错误"}`
+            )
+          );
+        } else {
+          this.importSummary.appendChild(createElement("div", "anich-ddm-import-empty", "当前没有 B 站导入记录。"));
+        }
+        return;
+      }
+
+      const counts = importInfo.counts || {};
+      const summaryHead = createElement(
+        "div",
+        "anich-ddm-import-summary-head",
+        `当前 ${safeNumber(counts.total, records.length)} 条导入 / 显式 ${safeNumber(counts.explicit, 0)} / 自动 ${safeNumber(counts.derived, 0)} / 映射链 ${safeNumber(counts.rules, 0)}`
+      );
+      const list = createElement("div", "anich-ddm-import-list");
+
+      records.forEach((record) => {
+        const item = createElement("div", "anich-ddm-import-item");
+        const head = createElement("div", "anich-ddm-import-item-head");
+        const title = createElement(
+          "div",
+          "anich-ddm-import-item-title",
+          record.title || record.partTitle || formatBilibiliImportLabel(record)
+        );
+        const removeButton = createElement("button", "anich-ddm-import-item-remove", "移除");
+        removeButton.type = "button";
+        removeButton.disabled = importInfo.phase === "loading" || importInfo.phase === "restoring";
+        removeButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.session.clearBilibiliImport(true, record.bindingKey);
+        });
+        head.append(title, removeButton);
+
+        const itemState =
+          record.sourceLoaded
+            ? "已叠加"
+            : record.derivedStatus === "series-rule"
+            ? "待按同季规则恢复"
+            : record.derivedStatus === "derived-cache"
+            ? "已缓存自动推导"
+            : "待恢复";
+        const offsetLabel =
+          record.sourceType === "pgc" || record.pgcEpId || record.pgcSeasonId
+            ? Number.isFinite(record.episodeOffset)
+              ? `集号 ${record.episodeOffset >= 0 ? "+" : ""}${record.episodeOffset}`
+              : "无"
+            : Number.isFinite(record.pageOffset)
+            ? `${record.pageOffset >= 0 ? "+" : ""}${record.pageOffset}`
+            : "无";
+        const ruleLabel = record.seriesRule
+          ? record.seriesRule.sourceType === "pgc"
+            ? `规则: 锚点第${safeNumber(record.seriesRule.anchorEpisode, 0)}集 -> ${
+                record.seriesRule.anchorPgcEpisodeNumber
+                  ? `B站第${safeNumber(record.seriesRule.anchorPgcEpisodeNumber, 0)}集`
+                  : `ep${safeNumber(record.seriesRule.anchorPgcEpId, 0)}`
+              }`
+            : `规则: 锚点第${safeNumber(record.seriesRule.anchorEpisode, 0)}集 -> P${safeNumber(record.seriesRule.anchorPage, 0)}`
+          : "规则: 无";
+        const metaLines = [
+          `标识: ${formatBilibiliImportLabel(record)}`,
+          `${record.sourceType === "pgc" || record.pgcEpId || record.pgcSeasonId ? "分集标题" : "分P标题"}: ${record.partTitle || "第 1 P"}`,
+          `绑定: ${getBilibiliImportBindingLabel(record.bindingMode)}`,
+          `恢复: ${getBilibiliImportDerivedStatusLabel(record.derivedStatus)}`,
+          `偏移: ${offsetLabel}`,
+          `弹幕数: ${safeNumber(record.commentCount, 0)} 条${safeNumber(record.availableCount, 0) ? ` / 可加载 ${safeNumber(record.availableCount, 0)} 条` : ""}${safeNumber(record.totalCount, 0) ? ` / 视频总数 ${safeNumber(record.totalCount, 0)} 条` : ""}`,
+          `状态: ${itemState}`,
+          ruleLabel,
+        ];
+        item.append(head, createElement("div", "anich-ddm-import-item-meta", metaLines.join("\n")));
+        list.appendChild(item);
+      });
+
+      if (failedRecord) {
+        list.appendChild(
+          createElement(
+            "div",
+            "anich-ddm-import-item-meta",
+            `最近失败: ${formatBilibiliImportLabel(failedRecord)}\n错误: ${importInfo.error || importInfo.message || "未知错误"}`
+          )
+        );
+      }
+
+      this.importSummary.append(summaryHead, list);
     }
 
     openMatcher() {
@@ -3271,10 +5224,35 @@
             .join("\n")}`
         : "";
 
+      const importInfo = session.getBilibiliImportDebugState();
+      if (this.importStatus) {
+        this.importStatus.textContent = importInfo.message || "未导入";
+        this.importStatus.classList.toggle("is-error", importInfo.phase === "error");
+      }
+      this.renderImportSummary(importInfo);
+      if (
+        this.importInput &&
+        !normalizeSpace(this.importInput.value) &&
+        importInfo.records?.length === 1 &&
+        importInfo.record?.rawInput
+      ) {
+        this.importInput.value = importInfo.record.rawInput;
+      }
+      if (this.importApplyButton) {
+        this.importApplyButton.disabled = importInfo.phase === "loading" || importInfo.phase === "restoring";
+      }
+      if (this.importClearButton) {
+        this.importClearButton.disabled =
+          importInfo.phase === "loading" ||
+          importInfo.phase === "restoring" ||
+          !(safeNumber(importInfo.counts?.total, 0) || safeNumber(importInfo.sourceLoadedCount, 0));
+      }
+
       const context = session.resolvePageContext();
       const transportConfig = session.transport.getConfig();
       const summaryLines = [
         `已加载: ${session.store.stats.count} | 可见: ${session.store.stats.visibleCount} | 已屏蔽: ${session.store.stats.filteredCount}`,
+        `来源桶: ${summarizeSourceBreakdown(session.store.stats.sourceBreakdown)}`,
         `显示区域: ${Math.round(settings.displayRegionRatio * 100)}% (仅滚动弹幕)`,
         `已启用类型: ${MODE_KEYS.filter((mode) => !settings.blockedModes[mode]).map((mode) => MODE_LABELS[mode]).join(" / ") || "无"}`,
         `关键词规则: ${settings.blockedKeywords.length} 条`,
@@ -3290,6 +5268,7 @@
         match ? `匹配结果: ${match.animeTitle} / ${match.episodeTitle}` : "匹配结果: 未匹配",
         match ? `来源: ${match.sourceName}` : `来源: ${session.lastEndpoint?.sourceName || "暂无"}`,
         `弹幕数: ${session.store.stats.count}`,
+        `B站导入: ${importInfo.message || "未导入"}`,
         `状态: ${session.statusMessage || "空闲"}`,
         `自定义 API: ${transportConfig.customApiPrefix || "未设置"}`,
       ];
@@ -3306,6 +5285,7 @@
       this.destroyed = false;
       this.settings = normalizeSettings(storageGet(SETTINGS_KEY, DEFAULT_SETTINGS));
       this.transport = app.transport;
+      this.bilibiliTransport = app.bilibiliTransport;
       this.store = new DanmakuStore();
       this.renderer = new Renderer(this);
       this.skipPrompt = new SkipPrompt(this);
@@ -3317,10 +5297,12 @@
       this.video = null;
       this.playerContainer = null;
       this.abortControllers = new Set();
+      this.abortHandles = new Set();
       this.bootstrapPromise = null;
       this.lastEndpoint = null;
       this.cachedContext = null;
       this.invalidRegexes = [];
+      this.bilibiliImport = this.getPendingBilibiliImportState();
     }
 
     makeAbortController() {
@@ -3336,9 +5318,25 @@
       return controller;
     }
 
+    registerAbortHandle(handle) {
+      if (typeof handle !== "function") {
+        return () => {};
+      }
+      this.abortHandles.add(handle);
+      return () => {
+        this.abortHandles.delete(handle);
+      };
+    }
+
     abortAll() {
       this.abortControllers.forEach((controller) => controller.abort());
       this.abortControllers.clear();
+      this.abortHandles.forEach((handle) => {
+        try {
+          handle();
+        } catch {}
+      });
+      this.abortHandles.clear();
     }
 
     destroy() {
@@ -3410,6 +5408,7 @@
       if (clearOverlay) {
         this.renderer.clear();
       }
+      this.scheduler.setSkipCue(findFirstSkipCue(this.store.items));
       this.scheduler.setComments(filterResult.comments);
       this.panel.update();
     }
@@ -3438,6 +5437,490 @@
       storageSet(PREFERENCE_CACHE_KEY, cache);
     }
 
+    getBilibiliImportCache() {
+      return storageGet(BILIBILI_IMPORT_CACHE_KEY, {});
+    }
+
+    saveBilibiliImportCache(cache) {
+      storageSet(BILIBILI_IMPORT_CACHE_KEY, cache);
+    }
+
+    getBilibiliImportSeriesCache() {
+      return storageGet(BILIBILI_IMPORT_SERIES_CACHE_KEY, {});
+    }
+
+    saveBilibiliImportSeriesCache(cache) {
+      storageSet(BILIBILI_IMPORT_SERIES_CACHE_KEY, cache);
+    }
+
+    getBilibiliImportRecordMap(routeKey = this.route.routeKey) {
+      return normalizeBilibiliImportRecordCollection(this.getBilibiliImportCache()[routeKey] || null);
+    }
+
+    getBilibiliImportRecords(routeKey = this.route.routeKey) {
+      return sortBilibiliImportRecords(Object.values(this.getBilibiliImportRecordMap(routeKey)));
+    }
+
+    getBilibiliImportRecord(routeKey = this.route.routeKey, bindingKey = "") {
+      const recordMap = this.getBilibiliImportRecordMap(routeKey);
+      if (bindingKey) {
+        return recordMap[normalizeSpace(bindingKey || "")] || null;
+      }
+      return pickPrimaryBilibiliImportRecord(Object.values(recordMap));
+    }
+
+    saveBilibiliImportRecord(routeKey, record, options = {}) {
+      if (!routeKey || !record) {
+        return null;
+      }
+      const normalized = normalizeBilibiliImportRecord(
+        Object.assign({}, record, {
+          updatedAt: Date.now(),
+        })
+      );
+      if (!normalized?.bindingKey) {
+        return null;
+      }
+      const cache = this.getBilibiliImportCache();
+      const routeRecordMap = this.getBilibiliImportRecordMap(routeKey);
+      routeRecordMap[normalized.bindingKey] = normalized;
+      cache[routeKey] = routeRecordMap;
+      this.saveBilibiliImportCache(cache);
+      if (options.updateState !== false && routeKey === this.route.routeKey) {
+        this.setBilibiliImportState(
+          "ready",
+          normalized.bindingMode === "derived"
+            ? `已按同季映射规则恢复 ${formatBilibiliImportLabel(normalized)}`
+            : `已导入 ${formatBilibiliImportLabel(normalized)}`,
+          normalized,
+          "",
+          {
+            activeBindingKey: normalized.bindingKey,
+          }
+        );
+      }
+      return normalized;
+    }
+
+    removeBilibiliImportRecord(routeKey, bindingKey, options = {}) {
+      if (!routeKey || !bindingKey) {
+        return null;
+      }
+      const normalizedBindingKey = normalizeSpace(bindingKey || "");
+      const cache = this.getBilibiliImportCache();
+      const routeRecordMap = this.getBilibiliImportRecordMap(routeKey);
+      const removed = routeRecordMap[normalizedBindingKey] || null;
+      if (!removed) {
+        return null;
+      }
+      delete routeRecordMap[normalizedBindingKey];
+      if (Object.keys(routeRecordMap).length) {
+        cache[routeKey] = routeRecordMap;
+      } else {
+        delete cache[routeKey];
+      }
+      this.saveBilibiliImportCache(cache);
+      if (options.updateState !== false && routeKey === this.route.routeKey) {
+        this.bilibiliImport = this.getPendingBilibiliImportState();
+        this.panel.update();
+      }
+      return removed;
+    }
+
+    getCurrentBilibiliImportRecordMap() {
+      return this.getBilibiliImportRecordMap(this.route.routeKey);
+    }
+
+    getCurrentBilibiliImportRecords() {
+      return this.getBilibiliImportRecords(this.route.routeKey);
+    }
+
+    getCurrentBilibiliImportRecord(bindingKey = "") {
+      return this.getBilibiliImportRecord(this.route.routeKey, bindingKey);
+    }
+
+    saveCurrentBilibiliImportRecord(record, options = {}) {
+      return this.saveBilibiliImportRecord(this.route.routeKey, record, options);
+    }
+
+    clearCurrentBilibiliImportRecord(options = {}) {
+      const currentRecords = this.getCurrentBilibiliImportRecords();
+      currentRecords.forEach((record) => {
+        this.removeBilibiliImportRecord(this.route.routeKey, record.bindingKey, {
+          updateState: false,
+        });
+      });
+      if (options.updateState !== false) {
+        this.bilibiliImport = this.getPendingBilibiliImportState();
+        this.panel.update();
+      }
+    }
+
+    getCurrentBilibiliSeriesKey(context = this.resolvePageContext()) {
+      return getBilibiliSeriesKey(context);
+    }
+
+    getBilibiliImportSeriesRuleMap(seriesKey = this.getCurrentBilibiliSeriesKey()) {
+      return normalizeBilibiliSeriesRuleCollection(this.getBilibiliImportSeriesCache()[seriesKey] || null, seriesKey);
+    }
+
+    getBilibiliImportSeriesRules(seriesKey = this.getCurrentBilibiliSeriesKey()) {
+      return sortBilibiliSeriesRules(Object.values(this.getBilibiliImportSeriesRuleMap(seriesKey)));
+    }
+
+    getBilibiliImportSeriesRule(seriesKey = this.getCurrentBilibiliSeriesKey(), chainKey = "") {
+      const ruleMap = this.getBilibiliImportSeriesRuleMap(seriesKey);
+      if (chainKey) {
+        return ruleMap[normalizeSpace(chainKey || "")] || null;
+      }
+      return sortBilibiliSeriesRules(Object.values(ruleMap))[0] || null;
+    }
+
+    saveBilibiliImportSeriesRule(seriesKey, rule) {
+      const normalized = normalizeBilibiliSeriesRule(
+        Object.assign({}, rule, {
+          seriesKey: seriesKey || rule?.seriesKey || "",
+          updatedAt: Date.now(),
+        })
+      );
+      if (!normalized?.seriesKey || !normalized?.chainKey) {
+        return null;
+      }
+      const cache = this.getBilibiliImportSeriesCache();
+      const ruleMap = this.getBilibiliImportSeriesRuleMap(normalized.seriesKey);
+      ruleMap[normalized.chainKey] = normalized;
+      cache[normalized.seriesKey] = ruleMap;
+      this.saveBilibiliImportSeriesCache(cache);
+      return normalized;
+    }
+
+    clearBilibiliImportSeriesRule(seriesKey, chainKey = "") {
+      if (!seriesKey) {
+        return 0;
+      }
+      const cache = this.getBilibiliImportSeriesCache();
+      if (!chainKey) {
+        if (cache[seriesKey]) {
+          delete cache[seriesKey];
+          this.saveBilibiliImportSeriesCache(cache);
+          return 1;
+        }
+        return 0;
+      }
+      const ruleMap = this.getBilibiliImportSeriesRuleMap(seriesKey);
+      const normalizedChainKey = normalizeSpace(chainKey || "");
+      if (!ruleMap[normalizedChainKey]) {
+        return 0;
+      }
+      delete ruleMap[normalizedChainKey];
+      if (Object.keys(ruleMap).length) {
+        cache[seriesKey] = ruleMap;
+      } else {
+        delete cache[seriesKey];
+      }
+      this.saveBilibiliImportSeriesCache(cache);
+      return 1;
+    }
+
+    clearDerivedBilibiliImportRecords(seriesKey, chainKey = "") {
+      if (!seriesKey) {
+        return 0;
+      }
+      const normalizedChainKey = normalizeSpace(chainKey || "");
+      const cache = this.getBilibiliImportCache();
+      let removed = 0;
+      Object.entries(cache).forEach(([routeKey, routeValue]) => {
+        const routeRecordMap = normalizeBilibiliImportRecordCollection(routeValue);
+        Object.values(routeRecordMap).forEach((record) => {
+          if (record.bindingMode !== "derived" || record.seriesKey !== seriesKey) {
+            return;
+          }
+          if (normalizedChainKey && record.chainKey !== normalizedChainKey) {
+            return;
+          }
+          delete routeRecordMap[record.bindingKey];
+          removed += 1;
+        });
+        if (Object.keys(routeRecordMap).length) {
+          cache[routeKey] = routeRecordMap;
+        } else {
+          delete cache[routeKey];
+        }
+      });
+      if (removed) {
+        this.saveBilibiliImportCache(cache);
+      }
+      return removed;
+    }
+
+    buildBilibiliSeriesRuleFromTarget(target, context, mergedRecord) {
+      const currentEpisode = readPositiveInt(context?.parsedEpisode || context?.episode);
+      const seriesKey = this.getCurrentBilibiliSeriesKey(context);
+      if (!currentEpisode || !seriesKey) {
+        return null;
+      }
+      if (target?.sourceType === "pgc" || mergedRecord?.sourceType === "pgc") {
+        const anchorPgcEpId = readPositiveInt(mergedRecord?.pgcEpId || target?.pgcEpId);
+        const anchorPgcEpisodeNumber = readPositiveInt(mergedRecord?.pgcEpisodeNumber || target?.pgcEpisodeNumber);
+        const pgcSeasonId = readPositiveInt(mergedRecord?.pgcSeasonId || target?.pgcSeasonId) || null;
+        if (!anchorPgcEpId && (!pgcSeasonId || !anchorPgcEpisodeNumber)) {
+          return null;
+        }
+        const episodeOffset = anchorPgcEpisodeNumber ? anchorPgcEpisodeNumber - currentEpisode : anchorPgcEpId - currentEpisode;
+        return normalizeBilibiliSeriesRule({
+          sourceType: "pgc",
+          seriesKey,
+          chainKey: buildBilibiliPgcSeriesChainKey(pgcSeasonId, episodeOffset, anchorPgcEpId),
+          normalizedTitleKey: context.normalizedTitleKey,
+          season: context.season || 1,
+          bvid: mergedRecord.bvid,
+          pgcEpId: anchorPgcEpId,
+          anchorPgcEpId,
+          pgcEpisodeNumber: anchorPgcEpisodeNumber,
+          anchorPgcEpisodeNumber,
+          pgcSeasonId,
+          title: mergedRecord.title,
+          anchorEpisode: currentEpisode,
+          anchorPage: 1,
+          episodeOffset,
+          anchorRouteKey: this.route.routeKey,
+        });
+      }
+      if (!target?.pageExplicit) {
+        return null;
+      }
+      const pageOffset = mergedRecord.page - currentEpisode;
+      return normalizeBilibiliSeriesRule({
+        sourceType: "video",
+        seriesKey,
+        chainKey: buildBilibiliSeriesChainKey(mergedRecord.bvid, pageOffset),
+        normalizedTitleKey: context.normalizedTitleKey,
+        season: context.season || 1,
+        bvid: mergedRecord.bvid,
+        title: mergedRecord.title,
+        anchorEpisode: currentEpisode,
+        anchorPage: mergedRecord.page,
+        pageOffset,
+        anchorRouteKey: this.route.routeKey,
+      });
+    }
+
+    seedDerivedBilibiliImportRecords(seriesRule) {
+      const normalizedRule = normalizeBilibiliSeriesRule(seriesRule);
+      if (!normalizedRule?.seriesKey || !normalizedRule?.chainKey) {
+        return 0;
+      }
+      this.clearDerivedBilibiliImportRecords(normalizedRule.seriesKey, normalizedRule.chainKey);
+      const routeEntries = readAniChEpisodeRouteEntries(this.route);
+      let seededCount = 0;
+      routeEntries.forEach((entry) => {
+        if (!entry?.routeKey || entry.routeKey === this.route.routeKey) {
+          return;
+        }
+        const derivedRecord = buildDerivedBilibiliImportRecord(normalizedRule, entry);
+        if (!derivedRecord?.bindingKey) {
+          return;
+        }
+        const existingRecords = this.getBilibiliImportRecords(entry.routeKey);
+        const hasExplicitConflict = existingRecords.some(
+          (record) =>
+            record.bindingMode === "explicit" &&
+            (record.chainKey === derivedRecord.chainKey || record.bindingKey === derivedRecord.bindingKey)
+        );
+        if (hasExplicitConflict) {
+          return;
+        }
+        this.saveBilibiliImportRecord(entry.routeKey, derivedRecord, {
+          updateState: false,
+        });
+        seededCount += 1;
+      });
+      return seededCount;
+    }
+
+    buildCurrentSeriesDerivedBilibiliRecords(currentRecordMap = this.getCurrentBilibiliImportRecordMap()) {
+      const context = this.resolvePageContext();
+      const currentEpisode = readPositiveInt(context?.parsedEpisode || context?.episode);
+      if (!currentEpisode) {
+        return [];
+      }
+      const currentRecords = Object.values(currentRecordMap || {});
+      const currentChainKeys = new Set(
+        currentRecords
+          .map((record) => normalizeSpace(record?.chainKey || ""))
+          .filter(Boolean)
+      );
+      const seriesRules = this.getBilibiliImportSeriesRules(this.getCurrentBilibiliSeriesKey(context));
+      const derivedRecords = [];
+      seriesRules.forEach((rule) => {
+        if (!rule?.chainKey || currentChainKeys.has(rule.chainKey)) {
+          return;
+        }
+        const derivedRecord = buildDerivedBilibiliImportRecord(rule, {
+          routeKey: this.route.routeKey,
+          href: this.route.href,
+          episode: currentEpisode,
+        });
+        if (!derivedRecord?.bindingKey) {
+          return;
+        }
+        const hasExplicitConflict = currentRecords.some(
+          (record) =>
+            record.bindingMode === "explicit" &&
+            (record.chainKey === derivedRecord.chainKey || record.bindingKey === derivedRecord.bindingKey)
+        );
+        if (hasExplicitConflict) {
+          return;
+        }
+        derivedRecords.push(derivedRecord);
+      });
+      return sortBilibiliImportRecords(derivedRecords);
+    }
+
+    getEffectiveCurrentBilibiliImportRecords() {
+      const currentRecordMap = this.getCurrentBilibiliImportRecordMap();
+      const effectiveRecordMap = Object.assign({}, currentRecordMap);
+      this.buildCurrentSeriesDerivedBilibiliRecords(currentRecordMap).forEach((record) => {
+        if (!effectiveRecordMap[record.bindingKey]) {
+          effectiveRecordMap[record.bindingKey] = record;
+        }
+      });
+      return sortBilibiliImportRecords(Object.values(effectiveRecordMap));
+    }
+
+    getPendingBilibiliImportState() {
+      const effectiveRecords = this.getEffectiveCurrentBilibiliImportRecords();
+      if (effectiveRecords.length) {
+        const explicitCount = effectiveRecords.filter((record) => record.bindingMode === "explicit").length;
+        const currentRecordMap = this.getCurrentBilibiliImportRecordMap();
+        const liveDerivedCount = effectiveRecords.filter(
+          (record) => record.bindingMode === "derived" && !currentRecordMap[record.bindingKey]
+        ).length;
+        const primaryRecord = pickPrimaryBilibiliImportRecord(effectiveRecords);
+        let message = `已缓存 ${effectiveRecords.length} 条 B 站导入，等待恢复`;
+        if (!explicitCount) {
+          message =
+            liveDerivedCount === effectiveRecords.length
+              ? `已缓存 ${effectiveRecords.length} 条同季映射规则，等待自动恢复`
+              : `已缓存 ${effectiveRecords.length} 条同季映射自动推导，等待恢复`;
+        }
+        return {
+          phase: "cached",
+          message,
+          record: primaryRecord,
+          activeBindingKey: primaryRecord?.bindingKey || "",
+          error: "",
+        };
+      }
+      return {
+        phase: "idle",
+        message: "未导入",
+        record: null,
+        activeBindingKey: "",
+        error: "",
+      };
+    }
+
+    clearCurrentBilibiliImportBinding(bindingKey = "", options = {}) {
+      const currentRecordMap = this.getCurrentBilibiliImportRecordMap();
+      const effectiveRecords = this.getEffectiveCurrentBilibiliImportRecords();
+      const targets = bindingKey
+        ? effectiveRecords.filter((record) => record.bindingKey === normalizeSpace(bindingKey || ""))
+        : effectiveRecords;
+      const clearedChains = new Set();
+      let removedBindings = 0;
+      targets.forEach((record) => {
+        if (!record?.bindingKey) {
+          return;
+        }
+        if (currentRecordMap[record.bindingKey]) {
+          this.removeBilibiliImportRecord(this.route.routeKey, record.bindingKey, {
+            updateState: false,
+          });
+          removedBindings += 1;
+        }
+        if (record.seriesKey && record.chainKey) {
+          const chainIdentity = `${record.seriesKey}::${record.chainKey}`;
+          if (!clearedChains.has(chainIdentity)) {
+            this.clearDerivedBilibiliImportRecords(record.seriesKey, record.chainKey);
+            this.clearBilibiliImportSeriesRule(record.seriesKey, record.chainKey);
+            clearedChains.add(chainIdentity);
+          }
+        }
+      });
+      if (options.updateState !== false) {
+        this.bilibiliImport = this.getPendingBilibiliImportState();
+        this.panel.update();
+      }
+      return {
+        removedBindings,
+        clearedChainCount: clearedChains.size,
+      };
+    }
+
+    setBilibiliImportState(phase, message, record = null, error = "", extra = {}) {
+      const normalizedRecord = normalizeBilibiliImportRecord(record);
+      this.bilibiliImport = {
+        phase,
+        message,
+        record: normalizedRecord,
+        activeBindingKey: normalizeSpace(extra.activeBindingKey || normalizedRecord?.bindingKey || ""),
+        error,
+      };
+      this.panel.update();
+    }
+
+    getBilibiliImportDebugState() {
+      const currentRecordMap = this.getCurrentBilibiliImportRecordMap();
+      const effectiveRecords = this.getEffectiveCurrentBilibiliImportRecords().map((record) => {
+        const sourceLoaded = this.store.hasSource(getBilibiliImportSourceKey(record.bindingKey));
+        const currentRecord = currentRecordMap[record.bindingKey] || null;
+        const seriesRule =
+          record.seriesKey && record.chainKey ? this.getBilibiliImportSeriesRule(record.seriesKey, record.chainKey) : null;
+        const derivedStatus =
+          record.bindingMode === "derived"
+            ? sourceLoaded
+              ? "restored"
+              : currentRecord
+              ? "derived-cache"
+              : "series-rule"
+            : "explicit";
+        return Object.assign({}, record, {
+          sourceKey: getBilibiliImportSourceKey(record.bindingKey),
+          sourceLoaded,
+          seriesRule,
+          derivedStatus,
+        });
+      });
+      const stateRecord = normalizeBilibiliImportRecord(this.bilibiliImport?.record);
+      const requestedBindingKey = normalizeSpace(
+        this.bilibiliImport?.activeBindingKey || stateRecord?.bindingKey || ""
+      );
+      const primaryRecord = pickPrimaryBilibiliImportRecord(effectiveRecords, requestedBindingKey);
+      const activeRecord = primaryRecord || null;
+      const sourceLoadedCount = effectiveRecords.filter((record) => record.sourceLoaded).length;
+      const seriesRules = this.getBilibiliImportSeriesRules(this.getCurrentBilibiliSeriesKey());
+      return Object.assign({}, this.bilibiliImport, {
+        record: stateRecord || activeRecord,
+        activeRecord,
+        records: effectiveRecords,
+        activeBindingKey: requestedBindingKey || activeRecord?.bindingKey || "",
+        sourceLoaded: activeRecord ? !!activeRecord.sourceLoaded : false,
+        sourceLoadedCount,
+        bindingMode: activeRecord?.bindingMode || stateRecord?.bindingMode || null,
+        derivedStatus: activeRecord?.derivedStatus || "none",
+        seriesRule: activeRecord?.seriesRule || null,
+        seriesRules,
+        counts: {
+          total: effectiveRecords.length,
+          explicit: effectiveRecords.filter((record) => record.bindingMode === "explicit").length,
+          derived: effectiveRecords.filter((record) => record.bindingMode === "derived").length,
+          loaded: sourceLoadedCount,
+          rules: seriesRules.length,
+        },
+      });
+    }
+
     getCurrentContextKey() {
       const context = this.resolvePageContext();
       if (!context) {
@@ -3451,7 +5934,8 @@
       const rawTitle = normalizeSpace(nextSignals.seriesTitle || nextSignals.episodeTitle || "");
       const pageTitle = normalizeSpace(nextSignals.episodeTitle || rawTitle);
       const altTitles = Array.isArray(nextSignals.altTitles) ? nextSignals.altTitles.filter(Boolean) : [];
-      const episode = extractEpisodeNumber(pageTitle) || this.route.episodeRouteId || null;
+      const parsedEpisode = extractEpisodeNumber(pageTitle);
+      const episode = parsedEpisode || this.route.episodeRouteId || null;
       const bangumiSeason = extractSeasonNumber(rawTitle) || 1;
       const title = cleanTitleTail(rawTitle || pageTitle);
       const parsedTitle = parseSearchKeyword(title);
@@ -3474,6 +5958,8 @@
         normalizedTitleKey,
         season,
         episode,
+        parsedEpisode: parsedEpisode || null,
+        hasParsedEpisode: !!parsedEpisode,
         aliases,
         searchTitle,
         seriesPreferenceKey: normalizedTitleKey,
@@ -3547,15 +6033,489 @@
         const cache = this.getExactCache();
         delete cache[key];
         this.saveExactCache(cache);
+        this.clearCurrentBilibiliImportBinding("", {
+          updateState: false,
+        });
       }
       this.currentMatch = null;
-      this.store.clear();
+      this.store.clearAll();
       this.renderer.clear();
       this.scheduler.setSkipCue(null);
       this.invalidRegexes = [];
       this.scheduler.setComments([]);
+      if (removeCache) {
+        const pendingImport = this.getPendingBilibiliImportState();
+        this.setBilibiliImportState(pendingImport.phase, pendingImport.message, pendingImport.record, "");
+      } else {
+        const pendingImport = this.getPendingBilibiliImportState();
+        this.setBilibiliImportState(pendingImport.phase, pendingImport.message, pendingImport.record, "");
+      }
       this.setStatus(removeCache ? "已清除当前匹配" : "已移除当前匹配，准备重新匹配", removeCache ? "空闲" : "重试中");
       this.panel.update();
+    }
+
+    async resolveBilibiliImportInput(rawInput) {
+      const parsed = parseBilibiliImportInput(rawInput);
+      if (!parsed.shortLink) {
+        return parsed;
+      }
+      const resolvedUrl = await this.bilibiliTransport.resolveShortLink(parsed.resolvedUrl, this);
+      const resolved = parseBilibiliImportInput(resolvedUrl);
+      return {
+        rawInput: parsed.rawInput,
+        resolvedUrl: resolved.resolvedUrl,
+        sourceType: resolved.sourceType,
+        bvid: resolved.bvid,
+        pgcEpId: resolved.pgcEpId,
+        pgcSeasonId: resolved.pgcSeasonId,
+        pgcEpisodeNumber: resolved.pgcEpisodeNumber,
+        page: resolved.page,
+        pageExplicit: !!resolved.pageExplicit,
+        pgcEpisodeExplicit: !!resolved.pgcEpisodeExplicit,
+      };
+    }
+
+    ensureBaseDanmakuLoaded() {
+      if (!this.currentMatch || !this.store.hasSource(DANDANPLAY_SOURCE_KEY)) {
+        throw new Error("请先等待当前页面弹幕加载完成");
+      }
+    }
+
+    removeLoadedBilibiliImportSources(bindingKeys = []) {
+      const targetBindingKeys = Array.isArray(bindingKeys)
+        ? bindingKeys
+            .map((bindingKey) => normalizeSpace(bindingKey || ""))
+            .filter(Boolean)
+        : [];
+      const sourceKeys = targetBindingKeys.length
+        ? targetBindingKeys.map((bindingKey) => getBilibiliImportSourceKey(bindingKey))
+        : Object.keys(this.store.stats?.sourceBreakdown || {}).filter(
+            (sourceKey) =>
+              sourceKey === BILIBILI_IMPORT_SOURCE_PREFIX ||
+              sourceKey.startsWith(`${BILIBILI_IMPORT_SOURCE_PREFIX}:`)
+          );
+      sourceKeys.forEach((sourceKey) => {
+        this.store.removeSource(sourceKey);
+      });
+    }
+
+    collectBilibiliRestoreRecords() {
+      const currentRecordMap = this.getCurrentBilibiliImportRecordMap();
+      const restoreEntries = this.getCurrentBilibiliImportRecords().map((record) => ({
+        record,
+        mode: record.bindingMode === "derived" ? "restore-derived" : "restore-explicit",
+      }));
+      this.buildCurrentSeriesDerivedBilibiliRecords(currentRecordMap).forEach((record) => {
+        restoreEntries.push({
+          record,
+          mode: "restore-series",
+        });
+      });
+      return restoreEntries;
+    }
+
+    async applyBilibiliImportRecord(record, token, options = {}) {
+      this.ensureBaseDanmakuLoaded();
+      const mode = options.mode || "manual";
+      const isDerivedRestore = mode === "restore-derived" || mode === "restore-series";
+      const isRestore = mode !== "manual";
+      const shouldUpdateState = options.updateState !== false;
+      const shouldRefresh = options.refreshAfter !== false;
+      const modeLabel = isDerivedRestore ? "自动恢复中" : isRestore ? "恢复中" : "导入中";
+      const modeMessage = isDerivedRestore
+        ? "正在按同季映射规则恢复 B 站弹幕..."
+        : isRestore
+        ? "正在恢复 B 站导入..."
+        : "正在导入 B 站弹幕...";
+      if (shouldUpdateState) {
+        this.setBilibiliImportState(isRestore ? "restoring" : "loading", modeMessage, record || null, "", {
+          activeBindingKey: record?.bindingKey || "",
+        });
+        this.setStatus(modeMessage, modeLabel);
+      }
+
+      const target = await this.resolveBilibiliImportInput(record?.rawInput || "");
+      if (!this.isFresh(token)) {
+        return false;
+      }
+      const videoMeta =
+        target.sourceType === "pgc"
+          ? await this.bilibiliTransport.resolvePgcEpisodeMeta(target, this)
+          : await this.bilibiliTransport.resolveVideoMeta(target.bvid, this);
+      if (!this.isFresh(token)) {
+        return false;
+      }
+      const selectedPart = this.bilibiliTransport.pickCid(
+        videoMeta.pages,
+        videoMeta.sourceType === "pgc" ? 1 : target.page
+      );
+      const { comments, viewData } = await this.bilibiliTransport.fetchSegmentedDanmaku(
+        {
+          bvid: videoMeta.bvid,
+          aid: videoMeta.aid,
+          cid: selectedPart.cid,
+          duration: videoMeta.duration,
+          partDuration: selectedPart.duration,
+          sessionEpisodeId: this.currentMatch?.episodeId ?? null,
+        },
+        this
+      );
+      if (!this.isFresh(token)) {
+        return false;
+      }
+      const context = this.resolvePageContext();
+      const nextSeriesRule = mode === "manual" ? this.buildBilibiliSeriesRuleFromTarget(target, context, {
+        sourceType: videoMeta.sourceType,
+        bvid: videoMeta.bvid,
+        pgcEpId: videoMeta.pgcEpId,
+        pgcSeasonId: videoMeta.pgcSeasonId,
+        pgcEpisodeNumber: videoMeta.pgcEpisodeNumber,
+        page: selectedPart.page,
+        title: videoMeta.title,
+      }) : null;
+      const activeSeriesRule =
+        nextSeriesRule
+          ? this.saveBilibiliImportSeriesRule(nextSeriesRule.seriesKey, nextSeriesRule)
+          : record?.seriesKey && record?.chainKey
+          ? this.getBilibiliImportSeriesRule(record.seriesKey, record.chainKey)
+          : null;
+      const mergedRecord = normalizeBilibiliImportRecord({
+        rawInput: record?.rawInput || target.rawInput,
+        resolvedUrl: target.resolvedUrl || videoMeta.resolvedUrl,
+        sourceType: videoMeta.sourceType || target.sourceType || "video",
+        bvid: videoMeta.bvid,
+        pgcEpId: videoMeta.pgcEpId || target.pgcEpId || null,
+        pgcSeasonId: videoMeta.pgcSeasonId || target.pgcSeasonId || null,
+        pgcEpisodeNumber: videoMeta.pgcEpisodeNumber || target.pgcEpisodeNumber || null,
+        page: selectedPart.page,
+        cid: selectedPart.cid,
+        title: videoMeta.title,
+        partTitle: selectedPart.part,
+        commentCount: comments.length,
+        availableCount: Math.max(safeNumber(viewData?.totalCount, 0), comments.length),
+        totalCount: Math.max(safeNumber(videoMeta?.totalDanmakuCount, 0), comments.length),
+        segmentCount: Math.max(1, safeNumber(viewData?.totalSegments, 0)),
+        segmentDurationMs: Math.max(1000, safeNumber(viewData?.segmentDurationMs, 360000)),
+        bindingKey:
+          nextSeriesRule?.chainKey ||
+          record?.bindingKey ||
+          (videoMeta.sourceType === "pgc"
+            ? buildBilibiliPgcStandaloneBindingKey(videoMeta.pgcEpId, videoMeta.pgcSeasonId, videoMeta.pgcEpisodeNumber)
+            : buildBilibiliStandaloneBindingKey(videoMeta.bvid, selectedPart.page)),
+        chainKey: normalizeSpace(nextSeriesRule?.chainKey || record?.chainKey || ""),
+        bindingMode: record?.bindingMode === "derived" ? "derived" : "explicit",
+        seriesKey: normalizeSpace(record?.seriesKey || ""),
+        anchorEpisode: readPositiveInt(record?.anchorEpisode) || null,
+        pageOffset: Number.isFinite(Number(record?.pageOffset)) ? Number(record.pageOffset) : null,
+        episodeOffset: Number.isFinite(Number(record?.episodeOffset)) ? Number(record.episodeOffset) : null,
+        derivedFromRouteKey: normalizeSpace(record?.derivedFromRouteKey || ""),
+        updatedAt: Date.now(),
+      });
+      if (!mergedRecord) {
+        throw new Error("无法生成有效的 B 站导入绑定");
+      }
+      if (nextSeriesRule) {
+        mergedRecord.bindingKey = nextSeriesRule.chainKey;
+        mergedRecord.chainKey = nextSeriesRule.chainKey;
+        mergedRecord.bindingMode = "explicit";
+        mergedRecord.seriesKey = nextSeriesRule.seriesKey;
+        mergedRecord.anchorEpisode = nextSeriesRule.anchorEpisode;
+        mergedRecord.pageOffset = nextSeriesRule.pageOffset;
+        mergedRecord.episodeOffset = nextSeriesRule.episodeOffset;
+        mergedRecord.pgcEpId = videoMeta.pgcEpId || mergedRecord.pgcEpId;
+        mergedRecord.pgcSeasonId = videoMeta.pgcSeasonId || mergedRecord.pgcSeasonId;
+        mergedRecord.pgcEpisodeNumber = videoMeta.pgcEpisodeNumber || mergedRecord.pgcEpisodeNumber;
+        mergedRecord.derivedFromRouteKey = "";
+      } else if (activeSeriesRule && mergedRecord.bindingMode === "explicit" && activeSeriesRule.chainKey === mergedRecord.chainKey) {
+        mergedRecord.bindingKey = activeSeriesRule.chainKey;
+        mergedRecord.seriesKey = activeSeriesRule.seriesKey;
+        mergedRecord.anchorEpisode = activeSeriesRule.anchorEpisode;
+        mergedRecord.pageOffset = activeSeriesRule.pageOffset;
+        mergedRecord.episodeOffset = activeSeriesRule.episodeOffset;
+      }
+      const sourceKey = getBilibiliImportSourceKey(mergedRecord.bindingKey);
+      this.store.replaceSource(sourceKey, comments, {
+        label: `B站 ${formatBilibiliImportLabel(mergedRecord)}`,
+        source: "bilibili",
+        episodeId: this.currentMatch?.episodeId ?? null,
+        rawInput: mergedRecord.rawInput,
+        sourceType: mergedRecord.sourceType,
+        bvid: mergedRecord.bvid,
+        pgcEpId: mergedRecord.pgcEpId,
+        pgcSeasonId: mergedRecord.pgcSeasonId,
+        pgcEpisodeNumber: mergedRecord.pgcEpisodeNumber,
+        page: mergedRecord.page,
+        title: mergedRecord.title,
+        partTitle: mergedRecord.partTitle,
+        bindingKey: mergedRecord.bindingKey,
+        chainKey: mergedRecord.chainKey,
+        bindingMode: mergedRecord.bindingMode,
+        seriesKey: mergedRecord.seriesKey,
+        anchorEpisode: mergedRecord.anchorEpisode,
+        pageOffset: mergedRecord.pageOffset,
+        episodeOffset: mergedRecord.episodeOffset,
+        derivedFromRouteKey: mergedRecord.derivedFromRouteKey,
+        availableCount: mergedRecord.availableCount,
+        totalCount: mergedRecord.totalCount,
+        segmentCount: mergedRecord.segmentCount,
+      });
+      if (shouldRefresh) {
+        this.refreshVisibleComments();
+      }
+      let seededCount = 0;
+      if (nextSeriesRule) {
+        seededCount = this.seedDerivedBilibiliImportRecords(nextSeriesRule);
+      }
+      const savedRecord = this.saveCurrentBilibiliImportRecord(mergedRecord, {
+        updateState: false,
+      });
+      const importCountParts = [];
+      if (mergedRecord.availableCount) {
+        importCountParts.push(`接口可加载 ${mergedRecord.availableCount} 条`);
+      }
+      if (mergedRecord.totalCount) {
+        importCountParts.push(`视频总数 ${mergedRecord.totalCount} 条`);
+      }
+      if (seededCount) {
+        importCountParts.push(`预填 ${seededCount} 集映射`);
+      }
+      if (shouldUpdateState) {
+        this.setBilibiliImportState(
+          "ready",
+          savedRecord.bindingMode === "derived"
+            ? `已按同季映射规则恢复 ${formatBilibiliImportLabel(savedRecord)}`
+            : `已导入 ${formatBilibiliImportLabel(savedRecord)}`,
+          savedRecord,
+          "",
+          {
+            activeBindingKey: savedRecord.bindingKey,
+          }
+        );
+        this.setStatus(
+          `${savedRecord.bindingMode === "derived" ? "已按同季映射规则叠加" : "已叠加"} B 站弹幕 ${comments.length} 条${importCountParts.length ? `（${importCountParts.join(" / ")}）` : ""}，当前共 ${this.store.stats.count} 条`,
+          savedRecord.bindingMode === "derived" ? "自动恢复" : "已导入"
+        );
+      }
+      this.panel.update();
+      return {
+        savedRecord,
+        comments,
+        sourceKey,
+        seededCount,
+        importCountParts,
+      };
+    }
+
+    async importBilibiliFromInput(rawInput) {
+      const token = this.token;
+      const attemptedRecord = buildBilibiliAttemptRecord(rawInput);
+      try {
+        const result = await this.applyBilibiliImportRecord({ rawInput }, token, {
+          mode: "manual",
+        });
+        return !!result;
+      } catch (error) {
+        if (this.isFresh(token)) {
+          const pendingImport = this.getPendingBilibiliImportState();
+          this.setBilibiliImportState(
+            "error",
+            `导入失败：${error.message || error}`,
+            attemptedRecord || pendingImport.record,
+            error.message || String(error),
+            {
+              activeBindingKey: attemptedRecord?.bindingKey || pendingImport.activeBindingKey,
+            }
+          );
+          this.setStatus(`B 站导入失败：${error.message || error}`, "导入失败");
+        }
+        return false;
+      }
+    }
+
+    clearBilibiliImport(removeCache = true, bindingKey = "") {
+      const targets = bindingKey
+        ? this.getEffectiveCurrentBilibiliImportRecords().filter(
+            (record) => record.bindingKey === normalizeSpace(bindingKey || "")
+          )
+        : this.getEffectiveCurrentBilibiliImportRecords();
+      this.removeLoadedBilibiliImportSources(targets.map((record) => record.bindingKey));
+      this.refreshVisibleComments();
+      if (removeCache) {
+        const clearResult = this.clearCurrentBilibiliImportBinding(bindingKey, {
+          updateState: false,
+        });
+        const pendingImport = this.getPendingBilibiliImportState();
+        this.setBilibiliImportState(
+          pendingImport.phase,
+          pendingImport.message,
+          pendingImport.record,
+          "",
+          {
+            activeBindingKey: pendingImport.activeBindingKey,
+          }
+        );
+        this.setStatus(
+          bindingKey
+            ? clearResult.clearedChainCount
+              ? "已清除所选 B 站导入及同季映射"
+              : "已清除所选 B 站导入"
+            : clearResult.clearedChainCount
+            ? "已清除当前集所有 B 站导入及同季映射"
+            : "已清除当前集所有 B 站导入",
+          "就绪"
+        );
+        return;
+      }
+      const pendingImport = this.getPendingBilibiliImportState();
+      this.setBilibiliImportState(
+        pendingImport.phase,
+        pendingImport.message,
+        pendingImport.record,
+        "",
+        {
+          activeBindingKey: pendingImport.activeBindingKey,
+        }
+      );
+      this.setStatus(
+        targets.some((record) => record.bindingMode === "derived")
+          ? "已移除 B 站导入，等待按同季映射规则恢复"
+          : "已移除 B 站导入，等待恢复",
+        "缓存"
+      );
+    }
+
+    async restoreBilibiliImportIfNeeded(token) {
+      const restoreEntries = this.collectBilibiliRestoreRecords();
+      if (!restoreEntries.length) {
+        this.removeLoadedBilibiliImportSources();
+        const pendingImport = this.getPendingBilibiliImportState();
+        this.setBilibiliImportState(
+          pendingImport.phase,
+          pendingImport.message,
+          pendingImport.record,
+          "",
+          {
+            activeBindingKey: pendingImport.activeBindingKey,
+          }
+        );
+        return false;
+      }
+      const primaryPendingRecord = pickPrimaryBilibiliImportRecord(restoreEntries.map((entry) => entry.record));
+      this.setBilibiliImportState(
+        "restoring",
+        `正在恢复 ${restoreEntries.length} 条 B 站导入...`,
+        primaryPendingRecord,
+        "",
+        {
+          activeBindingKey: primaryPendingRecord?.bindingKey || "",
+        }
+      );
+      this.setStatus(`正在恢复 ${restoreEntries.length} 条 B 站导入...`, "恢复中");
+
+      const restoredRecords = [];
+      const skippedRecords = [];
+      const failedEntries = [];
+
+      for (const entry of restoreEntries) {
+        try {
+          const result = await this.applyBilibiliImportRecord(entry.record, token, {
+            mode: entry.mode,
+            updateState: false,
+            refreshAfter: false,
+          });
+          if (!this.isFresh(token)) {
+            return false;
+          }
+          restoredRecords.push(result.savedRecord);
+        } catch (error) {
+          if (!this.isFresh(token)) {
+            return false;
+          }
+          const message = error?.message || String(error);
+          const isMissingPage =
+            entry.record.bindingMode === "derived" &&
+            (/未找到 P\d+/.test(String(message)) ||
+              ((entry.record.sourceType === "pgc" || entry.record.pgcEpId) &&
+                /(?:未找到 ep\d+|番剧分集|不存在|啥都木有)/.test(String(message))));
+          if (entry.mode === "restore-derived") {
+            this.removeBilibiliImportRecord(this.route.routeKey, entry.record.bindingKey, {
+              updateState: false,
+            });
+          }
+          this.removeLoadedBilibiliImportSources([entry.record.bindingKey]);
+          if (isMissingPage) {
+            skippedRecords.push({
+              record: entry.record,
+              message,
+            });
+          } else {
+            failedEntries.push({
+              record: entry.record,
+              message,
+            });
+          }
+        }
+      }
+
+      if (!this.isFresh(token)) {
+        return false;
+      }
+      this.refreshVisibleComments({ clearOverlay: false });
+
+      if (restoredRecords.length) {
+        const primaryRecord = pickPrimaryBilibiliImportRecord(restoredRecords);
+        const restoreSummary = [`已恢复 ${restoredRecords.length} 条 B 站导入`];
+        if (skippedRecords.length) {
+          restoreSummary.push(`跳过 ${skippedRecords.length} 条失效映射`);
+        }
+        if (failedEntries.length) {
+          restoreSummary.push(`失败 ${failedEntries.length} 条`);
+        }
+        this.setBilibiliImportState(
+          "ready",
+          restoreSummary.join("，"),
+          primaryRecord,
+          failedEntries.map((entry) => entry.message).join("\n"),
+          {
+            activeBindingKey: primaryRecord?.bindingKey || "",
+          }
+        );
+        this.setStatus(
+          `${restoreSummary.join("，")}，当前共 ${this.store.stats.count} 条弹幕`,
+          skippedRecords.length || failedEntries.length ? "部分恢复" : "自动恢复"
+        );
+        return true;
+      }
+
+      if (skippedRecords.length) {
+        const pendingImport = this.getPendingBilibiliImportState();
+        this.setBilibiliImportState(
+          pendingImport.phase,
+          `当前集未命中有效映射，已跳过 ${skippedRecords.length} 条自动导入`,
+          pendingImport.record,
+          skippedRecords.map((entry) => entry.message).join("\n"),
+          {
+            activeBindingKey: pendingImport.activeBindingKey,
+          }
+        );
+        this.setStatus(`当前集未命中有效映射，已跳过 ${skippedRecords.length} 条自动导入`, "已跳过");
+        return false;
+      }
+
+      if (failedEntries.length) {
+        const primaryFailure = failedEntries[0];
+        this.setBilibiliImportState(
+          "error",
+          `恢复失败：${primaryFailure.message}`,
+          primaryFailure.record,
+          failedEntries.map((entry) => entry.message).join("\n"),
+          {
+            activeBindingKey: primaryFailure.record?.bindingKey || "",
+          }
+        );
+        this.setStatus(`B 站导入恢复失败：${primaryFailure.message}`, "导入失败");
+      }
+      return false;
     }
 
     isFresh(token) {
@@ -3599,8 +6559,7 @@
         if (!autoMatch || !this.isFresh(token)) {
           if (this.isFresh(token)) {
             this.currentMatch = null;
-            this.store.clear();
-            this.scheduler.setSkipCue(null);
+            this.store.clearAll();
             this.scheduler.setComments([]);
             this.renderer.clear();
             this.setStatus("自动匹配失败，请手动搜索并确认。", "待匹配");
@@ -3845,10 +6804,16 @@
       }
       this.lastEndpoint = response.endpoint;
       const comments = this.normalizeComments(response.data, match, response.endpoint.sourceName || match.sourceName);
-      this.store.replace(comments, match, response.endpoint.sourceName || match.sourceName);
-      this.scheduler.setSkipCue(findFirstSkipCue(this.store.items));
+      this.store.replaceSource(DANDANPLAY_SOURCE_KEY, comments, {
+        label: response.endpoint.sourceName || match.sourceName || "弹弹 Play",
+        source: response.endpoint.sourceName || match.sourceName || "dandanplay",
+        episodeId: match.episodeId,
+      });
       this.refreshVisibleComments();
-      this.setStatus(`已加载 ${this.store.stats.count} 条弹幕`, "就绪");
+      const restored = await this.restoreBilibiliImportIfNeeded(token);
+      if (!restored && this.isFresh(token)) {
+        this.setStatus(`已加载 ${this.store.stats.count} 条弹幕`, "就绪");
+      }
       this.panel.update();
     }
   }
@@ -3856,6 +6821,7 @@
   class AniChDanmakuApp {
     constructor() {
       this.transport = new DandanplayTransport(this);
+      this.bilibiliTransport = new BilibiliTransport(this);
       this.activeSession = null;
       this.tokenSeed = 0;
       this.routeHref = "";
@@ -3969,7 +6935,7 @@
     }
 
     installDebugApi() {
-      window[DEBUG_NAMESPACE] = {
+      const debugApi = {
         getSession: () =>
           this.activeSession
             ? {
@@ -3988,6 +6954,9 @@
                 endpoint: this.activeSession.lastEndpoint,
                 settings: this.activeSession.settings,
                 invalidRegexes: this.activeSession.invalidRegexes,
+                imports: {
+                  bilibili: this.activeSession.getBilibiliImportDebugState(),
+                },
                 contextSource: this.activeSession.resolvePageContext()?.contextSource || null,
                 skipCue: this.activeSession.scheduler.getSkipCueDebugState(),
                 skipPrompt: this.activeSession.skipPrompt.getState(),
@@ -4002,6 +6971,8 @@
         openPanel: () => this.activeSession?.panel.openPanel(),
         openMatcher: () => this.activeSession?.panel.openMatcher(),
         clearMatch: () => this.activeSession?.clearCurrentMatch(true),
+        clearImport: () => this.activeSession?.clearBilibiliImport(true),
+        importBilibili: (input) => this.activeSession?.importBilibiliFromInput(input),
         toggle: () => {
           if (!this.activeSession) {
             return null;
@@ -4010,6 +6981,11 @@
           return this.activeSession.settings.enabled;
         },
       };
+      window[DEBUG_NAMESPACE] = debugApi;
+      const page = getPageWindow();
+      if (page && page !== window) {
+        page[DEBUG_NAMESPACE] = debugApi;
+      }
     }
   }
 
