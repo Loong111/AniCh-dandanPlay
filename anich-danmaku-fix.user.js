@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.6.8
+// @version      2.6.9
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -134,7 +134,7 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.6.8";
+  const USER_AGENT = "AniChDanmakuFix/2.6.9";
   const SKIP_CUE_KEYWORD = "空降";
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -2653,8 +2653,7 @@
       :fullscreen .anich-ddm-toolbar,
       :fullscreen .anich-ddm-panel,
       :fullscreen .anich-ddm-import-popover,
-      :fullscreen .anich-ddm-matcher,
-      :fullscreen .anich-ddm-skip-prompt {
+      :fullscreen .anich-ddm-matcher {
         display: none !important;
         visibility: hidden !important;
         pointer-events: none !important;
@@ -4364,7 +4363,8 @@
         return;
       }
       this.session.scheduler.markSkipCueClicked();
-      video.currentTime = cue.targetTime;
+      video.currentTime = this.session.scheduler.getPlaybackTimeForDanmakuTime(cue.targetTime);
+      this.session.scheduler.refreshFromCurrentTime(true);
       this.dismiss("clicked");
     }
 
@@ -4675,6 +4675,10 @@
         queuedComments: this.comments.length,
         cursor: this.cursor,
       });
+    }
+
+    getPlaybackTimeForDanmakuTime(danmakuTime) {
+      return Math.max(0, safeNumber(danmakuTime, 0) - safeNumber(this.session.settings?.offset, 0));
     }
 
     tick() {
