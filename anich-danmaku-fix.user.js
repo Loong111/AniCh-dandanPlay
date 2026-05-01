@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.5.2
+// @version      2.6.6
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -34,6 +34,7 @@
   const PREFERENCE_CACHE_KEY = `${STORAGE_PREFIX}seriesPreferenceCache`;
   const BILIBILI_IMPORT_CACHE_KEY = `${STORAGE_PREFIX}bilibiliImportCache`;
   const BILIBILI_IMPORT_SERIES_CACHE_KEY = `${STORAGE_PREFIX}bilibiliImportSeriesCache`;
+  const SIMILAR_MERGE_OPT_IN_KEY = `${STORAGE_PREFIX}similarMergeOptIn`;
   const TOOLBAR_POSITION_KEY = `${STORAGE_PREFIX}toolbarPosition`;
   const STYLE_ID = "anich-ddm-style";
   const DEBUG_NAMESPACE = "__anichDanmaku__";
@@ -65,6 +66,14 @@
     opacity: 0.9,
     speed: 1,
     offset: 0,
+    similarMergeEnabled: false,
+    similarMergeThreshold: 0.8,
+    similarMergeMinCount: 2,
+    similarMergeGapSeconds: 5,
+    similarMergeMaxSpanSeconds: 18,
+    maxEmitPerFrame: 12,
+    maxScheduledComments: 5000,
+    densityPreferMergedComments: false,
     blockedModes: DEFAULT_BLOCKED_MODES,
     blockedKeywords: [],
     blockedRegexes: [],
@@ -75,6 +84,12 @@
     opacity: { min: 0.2, max: 1, step: 0.05 },
     speed: { min: 0.5, max: 2, step: 0.1 },
     offset: { min: -10, max: 10, step: 0.1 },
+    similarMergeThreshold: { min: 0.5, max: 1, step: 0.01 },
+    similarMergeMinCount: { min: 2, max: 20, step: 1 },
+    similarMergeGapSeconds: { min: 1, max: 30, step: 0.5 },
+    similarMergeMaxSpanSeconds: { min: 2, max: 60, step: 1 },
+    maxEmitPerFrame: { min: 1, max: 80, step: 1 },
+    maxScheduledComments: { min: 1, max: 20000, step: 1 },
   });
   const DEFAULT_API_CONFIG = Object.freeze({
     customApiPrefix: "",
@@ -90,6 +105,8 @@
   const CONTEXT_WAIT_WINDOWS = 2;
   const IMPORT_POPOVER_CLOSE_DELAY_MS = 180;
   const CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS = 0.2;
+  const CONTROL_SETTING_DEBOUNCE_MS = 180;
+  const DENSITY_BUCKET_SECONDS = 1;
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
@@ -116,7 +133,7 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.5.2";
+  const USER_AGENT = "AniChDanmakuFix/2.6.6";
   const SKIP_CUE_KEYWORD = "空降";
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -215,9 +232,14 @@
   function normalizeSettings(input) {
     const next = Object.assign(cloneValue(DEFAULT_SETTINGS), input || {});
     next.enabled = !!next.enabled;
+    next.similarMergeEnabled = next.similarMergeEnabled !== false;
+    next.densityPreferMergedComments = !!(next.densityPreferMergedComments || next.densityPreferSingleComments);
     Object.entries(SETTING_LIMITS).forEach(([key, limit]) => {
       next[key] = clamp(safeNumber(next[key], DEFAULT_SETTINGS[key]), limit.min, limit.max);
     });
+    next.similarMergeMinCount = Math.round(next.similarMergeMinCount);
+    next.maxEmitPerFrame = Math.round(next.maxEmitPerFrame);
+    next.maxScheduledComments = Math.round(next.maxScheduledComments);
     next.blockedModes = Object.assign(cloneValue(DEFAULT_BLOCKED_MODES), next.blockedModes || {});
     MODE_KEYS.forEach((mode) => {
       next.blockedModes[mode] = !!next.blockedModes[mode];
@@ -293,6 +315,602 @@
     return {
       comments: filtered,
       invalidRegexes: compiled.invalid,
+    };
+  }
+
+  function normalizeDanmakuSimilarityText(value) {
+    let text = normalizeSpace(value).toLowerCase();
+    try {
+      text = text.normalize("NFKC");
+    } catch {}
+    return text
+      .replace(/[~`!@#$%^&*()_\-+=[\]{}\\|;:'",.<>/?，。！？、；：“”‘’（）【】《》「」『』·…—～￥]/g, "")
+      .replace(/\s+/g, "");
+  }
+
+  function collapseRepeatedText(value) {
+    return String(value || "").replace(/(.)\1+/g, "$1");
+  }
+
+  function makeBigramSet(value) {
+    const text = String(value || "");
+    const result = new Set();
+    for (let index = 0; index < text.length - 1; index += 1) {
+      result.add(text.slice(index, index + 2));
+    }
+    return result;
+  }
+
+  function calculateDanmakuTextSimilarity(a, b) {
+    const left = normalizeDanmakuSimilarityText(a);
+    const right = normalizeDanmakuSimilarityText(b);
+    if (!left || !right) {
+      return 0;
+    }
+    if (left === right) {
+      return 1;
+    }
+    const minLength = Math.min(left.length, right.length);
+    const maxLength = Math.max(left.length, right.length);
+    if (minLength <= 1) {
+      return 0;
+    }
+    if (left.includes(right) || right.includes(left)) {
+      const ratio = minLength / maxLength;
+      const repeatedCompatible = collapseRepeatedText(left) === collapseRepeatedText(right);
+      return repeatedCompatible ? Math.max(0.8, ratio) : ratio * 0.9;
+    }
+    if (minLength < 3) {
+      return 0;
+    }
+    if (Math.abs(left.length - right.length) > maxLength * 0.65) {
+      return 0.2;
+    }
+    const leftBigrams = makeBigramSet(left);
+    const rightBigrams = makeBigramSet(right);
+    if (!leftBigrams.size || !rightBigrams.size) {
+      return 0;
+    }
+    let intersection = 0;
+    leftBigrams.forEach((item) => {
+      if (rightBigrams.has(item)) {
+        intersection += 1;
+      }
+    });
+    return (2 * intersection) / (leftBigrams.size + rightBigrams.size);
+  }
+
+  function getSimilarMergeConfig(settings) {
+    const normalized = normalizeSettings(settings || {});
+    return {
+      enabled: !!normalized.similarMergeEnabled,
+      threshold: clamp(
+        safeNumber(normalized.similarMergeThreshold, DEFAULT_SETTINGS.similarMergeThreshold),
+        SETTING_LIMITS.similarMergeThreshold.min,
+        SETTING_LIMITS.similarMergeThreshold.max
+      ),
+      minCount: Math.round(
+        clamp(
+          safeNumber(normalized.similarMergeMinCount, DEFAULT_SETTINGS.similarMergeMinCount),
+          SETTING_LIMITS.similarMergeMinCount.min,
+          SETTING_LIMITS.similarMergeMinCount.max
+        )
+      ),
+      gapSeconds: clamp(
+        safeNumber(normalized.similarMergeGapSeconds, DEFAULT_SETTINGS.similarMergeGapSeconds),
+        SETTING_LIMITS.similarMergeGapSeconds.min,
+        SETTING_LIMITS.similarMergeGapSeconds.max
+      ),
+      maxSpanSeconds: clamp(
+        safeNumber(normalized.similarMergeMaxSpanSeconds, DEFAULT_SETTINGS.similarMergeMaxSpanSeconds),
+        SETTING_LIMITS.similarMergeMaxSpanSeconds.min,
+        SETTING_LIMITS.similarMergeMaxSpanSeconds.max
+      ),
+    };
+  }
+
+  function makeSimilarMergeStats(config, inputCount, outputCount, groups, collapsedCount) {
+    return {
+      enabled: !!config.enabled,
+      threshold: config.threshold,
+      minCount: config.minCount,
+      gapSeconds: config.gapSeconds,
+      maxSpanSeconds: config.maxSpanSeconds,
+      groups,
+      collapsedCount,
+      inputCount,
+      outputCount,
+    };
+  }
+
+  function createSimilarMergeCluster(entry) {
+    const displayText = normalizeSpace(entry.comment?.text || "");
+    const textKey = normalizeDanmakuSimilarityText(displayText) || displayText;
+    return {
+      startTime: safeNumber(entry.comment?.time, 0),
+      lastTime: safeNumber(entry.comment?.time, 0),
+      mode: MODE_MAP[entry.comment?.mode] || entry.comment?.mode || "rtl",
+      representativeText: displayText,
+      representativeCount: 1,
+      entries: [entry],
+      textCounts: new Map([[textKey, { text: displayText, count: 1, firstIndex: entry.index }]]),
+    };
+  }
+
+  function appendSimilarMergeCluster(cluster, entry) {
+    const time = safeNumber(entry.comment?.time, cluster.lastTime);
+    const displayText = normalizeSpace(entry.comment?.text || "");
+    const textKey = normalizeDanmakuSimilarityText(displayText) || displayText;
+    cluster.lastTime = Math.max(cluster.lastTime, time);
+    cluster.entries.push(entry);
+    const current = cluster.textCounts.get(textKey) || {
+      text: displayText,
+      count: 0,
+      firstIndex: entry.index,
+    };
+    current.count += 1;
+    cluster.textCounts.set(textKey, current);
+    if (
+      current.count > cluster.representativeCount ||
+      (current.count === cluster.representativeCount && current.firstIndex < cluster.entries[0].index)
+    ) {
+      cluster.representativeText = current.text;
+      cluster.representativeCount = current.count;
+    }
+  }
+
+  function createMergedDanmakuComment(cluster) {
+    const first = cluster.entries[0]?.comment || {};
+    const last = cluster.entries[cluster.entries.length - 1]?.comment || first;
+    const count = cluster.entries.length;
+    const startTime = safeNumber(first.time, cluster.startTime);
+    const endTime = safeNumber(last.time, cluster.lastTime);
+    const representativeText = cluster.representativeText || normalizeSpace(first.text || "");
+    return Object.assign({}, first, {
+      id: `merge:${first.id || cluster.entries[0]?.index || 0}:${count}:${Math.round(startTime * 1000)}:${Math.round(endTime * 1000)}`,
+      source: "merge",
+      text: `${representativeText}x${count}`,
+      time: startTime,
+      mode: MODE_MAP[first.mode] || first.mode || "rtl",
+      color: first.color || "#ffffff",
+      date: first.date,
+      episodeId: first.episodeId,
+      mergedCount: count,
+      mergedOriginalText: representativeText,
+      mergedStartTime: startTime,
+      mergedEndTime: endTime,
+      mergedIds: cluster.entries.map((entry) => String(entry.comment?.id || entry.index)),
+    });
+  }
+
+  function mergeSimilarDanmaku(comments, settings) {
+    const config = getSimilarMergeConfig(settings);
+    const list = (Array.isArray(comments) ? comments : [])
+      .map((comment, index) => ({ comment, index }))
+      .filter((entry) => entry.comment?.text && Number.isFinite(safeNumber(entry.comment?.time, NaN)))
+      .sort((left, right) => {
+        const diff = safeNumber(left.comment.time, 0) - safeNumber(right.comment.time, 0);
+        return diff || left.index - right.index;
+      });
+    if (!config.enabled || list.length < config.minCount) {
+      return {
+        comments: list.map((entry) => entry.comment),
+        stats: makeSimilarMergeStats(config, list.length, list.length, 0, 0),
+      };
+    }
+
+    const activeClusters = [];
+    const outputEntries = [];
+    let groups = 0;
+    let collapsedCount = 0;
+
+    const flushCluster = (cluster) => {
+      if (cluster.entries.length >= config.minCount) {
+        const mergedComment = createMergedDanmakuComment(cluster);
+        outputEntries.push({
+          comment: mergedComment,
+          index: cluster.entries[0]?.index ?? outputEntries.length,
+        });
+        groups += 1;
+        collapsedCount += cluster.entries.length - 1;
+        return;
+      }
+      cluster.entries.forEach((entry) => outputEntries.push(entry));
+    };
+
+    const flushExpiredClusters = (currentTime) => {
+      for (let index = activeClusters.length - 1; index >= 0; index -= 1) {
+        const cluster = activeClusters[index];
+        if (
+          currentTime - cluster.lastTime > config.gapSeconds ||
+          currentTime - cluster.startTime > config.maxSpanSeconds
+        ) {
+          activeClusters.splice(index, 1);
+          flushCluster(cluster);
+        }
+      }
+    };
+
+    for (const entry of list) {
+      const comment = entry.comment;
+      const time = safeNumber(comment.time, 0);
+      const mode = MODE_MAP[comment.mode] || comment.mode || "rtl";
+      flushExpiredClusters(time);
+
+      let bestCluster = null;
+      let bestSimilarity = 0;
+      for (const cluster of activeClusters) {
+        if (cluster.mode !== mode) {
+          continue;
+        }
+        if (time - cluster.lastTime > config.gapSeconds || time - cluster.startTime > config.maxSpanSeconds) {
+          continue;
+        }
+        const similarity = calculateDanmakuTextSimilarity(comment.text, cluster.representativeText);
+        if (similarity >= config.threshold && similarity > bestSimilarity) {
+          bestSimilarity = similarity;
+          bestCluster = cluster;
+        }
+      }
+
+      if (bestCluster) {
+        appendSimilarMergeCluster(bestCluster, entry);
+      } else {
+        activeClusters.push(createSimilarMergeCluster(entry));
+      }
+    }
+
+    while (activeClusters.length) {
+      flushCluster(activeClusters.shift());
+    }
+
+    outputEntries.sort((left, right) => {
+      const diff = safeNumber(left.comment.time, 0) - safeNumber(right.comment.time, 0);
+      return diff || left.index - right.index;
+    });
+    const mergedComments = outputEntries.map((entry) => entry.comment);
+    return {
+      comments: mergedComments,
+      stats: makeSimilarMergeStats(config, list.length, mergedComments.length, groups, collapsedCount),
+    };
+  }
+
+  function normalizeDensityDurationSeconds(value) {
+    const parsed = safeNumber(value, 0);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.ceil(parsed)) : 0;
+  }
+
+  function getCommentTimelineDurationSeconds(comments) {
+    const list = Array.isArray(comments) ? comments : [];
+    let maxTime = 0;
+    list.forEach((comment) => {
+      maxTime = Math.max(maxTime, safeNumber(comment?.time, 0));
+    });
+    return normalizeDensityDurationSeconds(maxTime);
+  }
+
+  function getDensityMaxEmitForDuration(durationSeconds) {
+    const duration = normalizeDensityDurationSeconds(durationSeconds);
+    if (!duration) {
+      return SETTING_LIMITS.maxEmitPerFrame.max;
+    }
+    return Math.round(
+      clamp(
+        Math.ceil(SETTING_LIMITS.maxScheduledComments.max / duration),
+        SETTING_LIMITS.maxEmitPerFrame.min,
+        SETTING_LIMITS.maxEmitPerFrame.max
+      )
+    );
+  }
+
+  function getDensityBucketCounts(comments, bucketSeconds = DENSITY_BUCKET_SECONDS) {
+    const list = Array.isArray(comments) ? comments : [];
+    const buckets = new Map();
+    list.forEach((comment) => {
+      const time = Math.max(0, safeNumber(comment?.time, 0));
+      const bucketKey = Math.floor(time / bucketSeconds);
+      buckets.set(bucketKey, (buckets.get(bucketKey) || 0) + 1);
+    });
+    const counts = Array.from(buckets.values());
+    return {
+      counts,
+      peakCount: counts.reduce((peak, count) => Math.max(peak, count), 0),
+      totalCount: list.length,
+    };
+  }
+
+  function getDensityScheduleCapacityForCounts(counts, maxEmitPerFrame) {
+    const emitLimit = Math.max(0, Math.round(maxEmitPerFrame));
+    return (Array.isArray(counts) ? counts : []).reduce(
+      (total, count) => total + Math.min(Math.max(0, Math.round(count)), emitLimit),
+      0
+    );
+  }
+
+  function getDensityFallbackScheduleCapacity(maxEmitPerFrame, durationSeconds) {
+    const duration = normalizeDensityDurationSeconds(durationSeconds);
+    if (!duration) {
+      return SETTING_LIMITS.maxScheduledComments.max;
+    }
+    return Math.round(
+      clamp(
+        Math.round(maxEmitPerFrame) * duration,
+        SETTING_LIMITS.maxScheduledComments.min,
+        SETTING_LIMITS.maxScheduledComments.max
+      )
+    );
+  }
+
+  function getDensityScheduleCapacity(comments, maxEmitPerFrame, durationSeconds) {
+    const bucketStats = getDensityBucketCounts(comments);
+    const rawCapacity = bucketStats.totalCount
+      ? getDensityScheduleCapacityForCounts(bucketStats.counts, maxEmitPerFrame)
+      : getDensityFallbackScheduleCapacity(maxEmitPerFrame, durationSeconds);
+    return Math.round(
+      clamp(
+        rawCapacity,
+        SETTING_LIMITS.maxScheduledComments.min,
+        SETTING_LIMITS.maxScheduledComments.max
+      )
+    );
+  }
+
+  function getDensityMaxEmitForTimeline(comments, durationSeconds) {
+    const bucketStats = getDensityBucketCounts(comments);
+    if (bucketStats.totalCount) {
+      return Math.round(
+        clamp(
+          bucketStats.peakCount || SETTING_LIMITS.maxEmitPerFrame.min,
+          SETTING_LIMITS.maxEmitPerFrame.min,
+          SETTING_LIMITS.maxEmitPerFrame.max
+        )
+      );
+    }
+    return getDensityMaxEmitForDuration(durationSeconds);
+  }
+
+  function getDensityEmitForScheduledCount(comments, targetCount, durationSeconds) {
+    const target = Math.round(
+      clamp(
+        safeNumber(targetCount, DEFAULT_SETTINGS.maxScheduledComments),
+        SETTING_LIMITS.maxScheduledComments.min,
+        SETTING_LIMITS.maxScheduledComments.max
+      )
+    );
+    const bucketStats = getDensityBucketCounts(comments);
+    const maxEmit = getDensityMaxEmitForTimeline(comments, durationSeconds);
+    if (!bucketStats.totalCount) {
+      const duration = normalizeDensityDurationSeconds(durationSeconds);
+      return Math.round(
+        clamp(
+          duration ? Math.ceil(target / duration) : DEFAULT_SETTINGS.maxEmitPerFrame,
+          SETTING_LIMITS.maxEmitPerFrame.min,
+          maxEmit
+        )
+      );
+    }
+    for (let emit = SETTING_LIMITS.maxEmitPerFrame.min; emit <= maxEmit; emit += 1) {
+      if (getDensityScheduleCapacityForCounts(bucketStats.counts, emit) >= target) {
+        return emit;
+      }
+    }
+    return maxEmit;
+  }
+
+  function resolveDensityLimitSettings(settings, durationSeconds, changedKey = null, comments = []) {
+    const next = normalizeSettings(settings || {});
+    const duration = normalizeDensityDurationSeconds(durationSeconds);
+    const maxEmitForTimeline = getDensityMaxEmitForTimeline(comments, duration);
+    next.maxEmitPerFrame = Math.round(
+      clamp(next.maxEmitPerFrame, SETTING_LIMITS.maxEmitPerFrame.min, maxEmitForTimeline)
+    );
+    next.maxScheduledComments = Math.round(
+      clamp(
+        next.maxScheduledComments,
+        SETTING_LIMITS.maxScheduledComments.min,
+        SETTING_LIMITS.maxScheduledComments.max
+      )
+    );
+
+    let scheduleCapacity = getDensityScheduleCapacity(comments, next.maxEmitPerFrame, duration);
+    if (changedKey === "maxScheduledComments" && next.maxScheduledComments > scheduleCapacity) {
+      next.maxEmitPerFrame = getDensityEmitForScheduledCount(comments, next.maxScheduledComments, duration);
+      scheduleCapacity = getDensityScheduleCapacity(comments, next.maxEmitPerFrame, duration);
+    }
+    next.maxScheduledComments = Math.round(
+      clamp(next.maxScheduledComments, SETTING_LIMITS.maxScheduledComments.min, scheduleCapacity)
+    );
+
+    return {
+      settings: next,
+      durationSeconds: duration,
+      bounds: {
+        maxEmitPerFrame: {
+          min: SETTING_LIMITS.maxEmitPerFrame.min,
+          max: maxEmitForTimeline,
+        },
+        maxScheduledComments: {
+          min: SETTING_LIMITS.maxScheduledComments.min,
+          max: scheduleCapacity,
+        },
+      },
+    };
+  }
+
+  function getDensityLimitConfig(settings, durationSeconds, comments = []) {
+    const resolved = resolveDensityLimitSettings(settings || {}, durationSeconds, null, comments);
+    return {
+      maxEmitPerFrame: resolved.settings.maxEmitPerFrame,
+      maxScheduledComments: resolved.settings.maxScheduledComments,
+      preferMergedComments: !!resolved.settings.densityPreferMergedComments,
+      durationSeconds: resolved.durationSeconds,
+      bounds: resolved.bounds,
+      bucketSeconds: DENSITY_BUCKET_SECONDS,
+    };
+  }
+
+  function isMergedDanmakuComment(comment) {
+    return safeNumber(comment?.mergedCount, 0) > 1 || comment?.source === "merge";
+  }
+
+  function makeDensityEntry(comment, index) {
+    return {
+      comment,
+      index,
+      merged: isMergedDanmakuComment(comment),
+    };
+  }
+
+  function selectEvenlySpacedEntries(entries, maxCount) {
+    const list = Array.isArray(entries) ? entries : [];
+    const targetCount = Math.max(0, Math.round(maxCount));
+    if (list.length <= targetCount) {
+      return list.slice();
+    }
+    if (targetCount <= 0) {
+      return [];
+    }
+    if (targetCount === 1) {
+      return [list[0]];
+    }
+    const selected = [];
+    const lastIndex = list.length - 1;
+    let previousIndex = -1;
+    for (let index = 0; index < targetCount; index += 1) {
+      const remaining = targetCount - index;
+      const highestAllowed = list.length - remaining;
+      const idealIndex = Math.round((index * lastIndex) / (targetCount - 1));
+      const nextIndex = clamp(Math.max(idealIndex, previousIndex + 1), 0, highestAllowed);
+      selected.push(list[nextIndex]);
+      previousIndex = nextIndex;
+    }
+    return selected;
+  }
+
+  function selectDensityEntries(entries, maxCount, preferMergedComments) {
+    const list = Array.isArray(entries) ? entries : [];
+    const targetCount = Math.max(0, Math.round(maxCount));
+    if (list.length <= targetCount) {
+      return list.slice();
+    }
+    if (!preferMergedComments) {
+      return selectEvenlySpacedEntries(list, targetCount);
+    }
+    const mergedEntries = list.filter((entry) => entry.merged);
+    const singleEntries = list.filter((entry) => !entry.merged);
+    const selected =
+      mergedEntries.length >= targetCount
+        ? selectEvenlySpacedEntries(mergedEntries, targetCount)
+        : mergedEntries.concat(selectEvenlySpacedEntries(singleEntries, targetCount - mergedEntries.length));
+    return selected.sort((left, right) => left.index - right.index);
+  }
+
+  function limitDanmakuByDensity(comments, maxCount, preferMergedComments) {
+    const entries = (Array.isArray(comments) ? comments : []).map(makeDensityEntry);
+    const selectedEntries = selectDensityEntries(entries, maxCount, preferMergedComments);
+    const selectedIndexes = new Set(selectedEntries.map((entry) => entry.index));
+    let droppedMergedCount = 0;
+    let droppedSingleCount = 0;
+    entries.forEach((entry) => {
+      if (selectedIndexes.has(entry.index)) {
+        return;
+      }
+      if (entry.merged) {
+        droppedMergedCount += 1;
+      } else {
+        droppedSingleCount += 1;
+      }
+    });
+    return {
+      comments: selectedEntries.map((entry) => entry.comment),
+      droppedMergedCount,
+      droppedSingleCount,
+    };
+  }
+
+  function limitDanmakuByLocalDensity(comments, maxEmitPerFrame, preferMergedComments) {
+    const entries = (Array.isArray(comments) ? comments : []).map(makeDensityEntry);
+    const groups = new Map();
+    entries.forEach((entry) => {
+      const time = Math.max(0, safeNumber(entry.comment?.time, 0));
+      const bucketKey = Math.floor(time / DENSITY_BUCKET_SECONDS);
+      if (!groups.has(bucketKey)) {
+        groups.set(bucketKey, []);
+      }
+      groups.get(bucketKey).push(entry);
+    });
+    const selectedEntries = [];
+    Array.from(groups.keys())
+      .sort((left, right) => left - right)
+      .forEach((bucketKey) => {
+        selectedEntries.push(
+          ...selectDensityEntries(groups.get(bucketKey), maxEmitPerFrame, preferMergedComments)
+        );
+      });
+    selectedEntries.sort((left, right) => left.index - right.index);
+    const selectedIndexes = new Set(selectedEntries.map((entry) => entry.index));
+    let droppedMergedCount = 0;
+    let droppedSingleCount = 0;
+    entries.forEach((entry) => {
+      if (selectedIndexes.has(entry.index)) {
+        return;
+      }
+      if (entry.merged) {
+        droppedMergedCount += 1;
+      } else {
+        droppedSingleCount += 1;
+      }
+    });
+    return {
+      comments: selectedEntries.map((entry) => entry.comment),
+      droppedMergedCount,
+      droppedSingleCount,
+    };
+  }
+
+  function makeDensityLimitStats(config, inputCount, outputCount, detail = {}) {
+    return {
+      maxEmitPerFrame: config.maxEmitPerFrame,
+      maxScheduledComments: config.maxScheduledComments,
+      preferMergedComments: !!config.preferMergedComments,
+      durationSeconds: config.durationSeconds,
+      bucketSeconds: config.bucketSeconds,
+      bounds: config.bounds,
+      inputCount,
+      outputCount,
+      droppedCount: Math.max(0, inputCount - outputCount),
+      droppedMergedCount: safeNumber(detail.droppedMergedCount, 0),
+      droppedSingleCount: safeNumber(detail.droppedSingleCount, 0),
+    };
+  }
+
+  function limitScheduledDanmaku(comments, settings, durationSeconds) {
+    const config = getDensityLimitConfig(settings, durationSeconds, comments);
+    const list = Array.isArray(comments) ? comments : [];
+    const localLimited = limitDanmakuByLocalDensity(
+      list,
+      config.maxEmitPerFrame,
+      config.preferMergedComments
+    );
+    let outputComments = localLimited.comments;
+    let droppedMergedCount = localLimited.droppedMergedCount;
+    let droppedSingleCount = localLimited.droppedSingleCount;
+    if (outputComments.length > config.maxScheduledComments) {
+      const globallyLimited = limitDanmakuByDensity(
+        outputComments,
+        config.maxScheduledComments,
+        config.preferMergedComments
+      );
+      outputComments = globallyLimited.comments;
+      droppedMergedCount += globallyLimited.droppedMergedCount;
+      droppedSingleCount += globallyLimited.droppedSingleCount;
+    }
+    return {
+      comments: outputComments,
+      stats: makeDensityLimitStats(config, list.length, outputComments.length, {
+        droppedMergedCount,
+        droppedSingleCount,
+      }),
     };
   }
 
@@ -419,6 +1037,18 @@
 
   function storageSet(key, value) {
     localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  function storageGetBoolean(key, fallback = false) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw == null) {
+        return !!fallback;
+      }
+      return JSON.parse(raw) === true;
+    } catch {
+      return !!fallback;
+    }
   }
 
   function getPageWindow() {
@@ -2076,9 +2706,28 @@
         inset: 0;
         z-index: 2147483000;
         overflow: hidden;
-        pointer-events: none;
+        pointer-events: none !important;
         contain: layout style size;
         font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+
+      .anich-ddm-overlay * {
+        pointer-events: none !important;
+      }
+
+      :fullscreen .anich-ddm-overlay {
+        z-index: 1 !important;
+        pointer-events: none !important;
+      }
+
+      :fullscreen .anich-ddm-toolbar,
+      :fullscreen .anich-ddm-panel,
+      :fullscreen .anich-ddm-import-popover,
+      :fullscreen .anich-ddm-matcher,
+      :fullscreen .anich-ddm-skip-prompt {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
       }
 
       .anich-ddm-skip-prompt {
@@ -2535,6 +3184,29 @@
         margin: 0;
       }
 
+      .anich-ddm-row-density {
+        grid-template-columns: 58px minmax(0, 1fr) 76px 54px;
+      }
+
+      .anich-ddm-number-input {
+        width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(244, 249, 255, 0.94);
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 6px;
+        outline: none;
+      }
+
+      .anich-ddm-number-input:focus {
+        border-color: rgba(129, 207, 255, 0.58);
+        background: rgba(255, 255, 255, 0.09);
+      }
+
       .anich-ddm-row input[type="checkbox"] {
         margin: 0;
         justify-self: start;
@@ -2708,8 +3380,13 @@
         border-radius: 16px;
         box-shadow: 0 16px 42px rgba(0, 0, 0, 0.42);
         backdrop-filter: blur(16px);
-        pointer-events: auto;
+        pointer-events: auto !important;
         display: none;
+      }
+
+      .anich-ddm-matcher,
+      .anich-ddm-matcher * {
+        pointer-events: auto !important;
       }
 
       .anich-ddm-matcher.is-open {
@@ -3802,6 +4479,15 @@
       this.running = false;
       this.skipCue = null;
       this.skipCueState = this.createSkipCueState(null, 0);
+      this.emitStats = {
+        lastFrameEmitted: 0,
+        lastFrameDropped: 0,
+        lastFrameDroppedMerged: 0,
+        lastFrameDroppedSingle: 0,
+        totalDropped: 0,
+        totalDroppedMerged: 0,
+        totalDroppedSingle: 0,
+      };
       this.tick = this.tick.bind(this);
     }
 
@@ -3873,6 +4559,15 @@
       this.lastTargetTime = null;
       this.skipCue = null;
       this.skipCueState = this.createSkipCueState(null, 0);
+      this.emitStats = {
+        lastFrameEmitted: 0,
+        lastFrameDropped: 0,
+        lastFrameDroppedMerged: 0,
+        lastFrameDroppedSingle: 0,
+        totalDropped: 0,
+        totalDroppedMerged: 0,
+        totalDroppedSingle: 0,
+      };
     }
 
     refreshFromCurrentTime(clearOverlay = true) {
@@ -4006,6 +4701,47 @@
       };
     }
 
+    getEmitLimit() {
+      return getDensityLimitConfig(
+        this.session.settings,
+        this.session.getDensityDurationSeconds(),
+        this.comments
+      ).maxEmitPerFrame;
+    }
+
+    emitDueComments(targetTime) {
+      const cutoffTime = targetTime + 0.05;
+      const config = getDensityLimitConfig(
+        this.session.settings,
+        this.session.getDensityDurationSeconds(),
+        this.comments
+      );
+      const dueComments = [];
+      while (this.cursor < this.comments.length && this.comments[this.cursor].time <= cutoffTime) {
+        dueComments.push(this.comments[this.cursor]);
+        this.cursor += 1;
+      }
+      const limited = limitDanmakuByDensity(dueComments, config.maxEmitPerFrame, config.preferMergedComments);
+      limited.comments.forEach((comment) => this.session.renderer.emit(comment));
+      const emitted = limited.comments.length;
+      const dropped = dueComments.length - emitted;
+      this.emitStats.lastFrameEmitted = emitted;
+      this.emitStats.lastFrameDropped = dropped;
+      this.emitStats.totalDropped += dropped;
+      this.emitStats.lastFrameDroppedMerged = limited.droppedMergedCount;
+      this.emitStats.lastFrameDroppedSingle = limited.droppedSingleCount;
+      this.emitStats.totalDroppedMerged += limited.droppedMergedCount;
+      this.emitStats.totalDroppedSingle += limited.droppedSingleCount;
+    }
+
+    getDensityDebugState() {
+      return Object.assign({}, this.emitStats, {
+        maxEmitPerFrame: this.getEmitLimit(),
+        queuedComments: this.comments.length,
+        cursor: this.cursor,
+      });
+    }
+
     tick() {
       if (!this.running || this.session.destroyed) {
         return;
@@ -4031,10 +4767,7 @@
         this.maybeShowSkipCue(previousTargetTime, targetTime, video.paused);
 
         if (this.session.settings.enabled && this.comments.length && !video.paused) {
-          while (this.cursor < this.comments.length && this.comments[this.cursor].time <= targetTime + 0.05) {
-            this.session.renderer.emit(this.comments[this.cursor]);
-            this.cursor += 1;
-          }
+          this.emitDueComments(targetTime);
         }
       }
 
@@ -4067,6 +4800,15 @@
       this.regexInput = null;
       this.regexList = null;
       this.regexErrors = null;
+      this.similarMergeEnabledInput = null;
+      this.similarMergeInputs = {};
+      this.similarMergeValues = {};
+      this.densityLimitInputs = {};
+      this.densityLimitNumberInputs = {};
+      this.densityLimitValues = {};
+      this.densityPreferMergedInput = null;
+      this.pendingSettingTimers = new Map();
+      this.pendingSettingValues = new Map();
       this.apiInput = null;
       this.matcher = null;
       this.searchInput = null;
@@ -4103,6 +4845,12 @@
 
     attach(playerContainer, overlay) {
       if (!playerContainer || !overlay) {
+        return;
+      }
+      if (this.isFullscreenActive()) {
+        this.playerContainer = playerContainer;
+        this.overlay = overlay;
+        this.detachControlNodes();
         return;
       }
 
@@ -4157,11 +4905,49 @@
       this.update();
     }
 
+    isFullscreenActive() {
+      return document.fullscreenElement instanceof Element;
+    }
+
+    detachControlNodes() {
+      document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
+      this.stopToolbarDrag(false);
+      this.clearImportPopoverCloseTimer();
+      this.clearPendingSettingUpdates();
+      if (this.toolbar?.isConnected) {
+        this.toolbar.remove();
+      }
+      if (this.importPopover?.isConnected) {
+        this.importPopover.remove();
+      }
+      if (this.panel?.isConnected) {
+        this.panel.remove();
+      }
+      if (this.matcher?.isConnected) {
+        this.matcher.remove();
+      }
+      this.toolbar = null;
+      this.toolbarHandle = null;
+      this.settingsEntry = null;
+      this.toggleEntry = null;
+      this.importPopover = null;
+      this.importInput = null;
+      this.importStatus = null;
+      this.importSummary = null;
+      this.importApplyButton = null;
+      this.importClearButton = null;
+      this.panel = null;
+      this.densityPreferMergedInput = null;
+      this.matcher = null;
+      this.releaseToolbarHost();
+    }
+
     destroy() {
       document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
       window.removeEventListener("resize", this.handleViewportChange, true);
       this.stopToolbarDrag(false);
       this.clearImportPopoverCloseTimer();
+      this.clearPendingSettingUpdates();
       if (this.toolbar?.isConnected) {
         this.toolbar.remove();
       }
@@ -4188,6 +4974,7 @@
       this.playerContainer = null;
       this.overlay = null;
       this.panel = null;
+      this.densityPreferMergedInput = null;
       this.matcher = null;
     }
 
@@ -4417,6 +5204,146 @@
       this.closeImportPopover(false);
     }
 
+    isControlActive(input) {
+      return input && document.activeElement === input;
+    }
+
+    syncInputValue(input, value) {
+      if (!input || this.isControlActive(input)) {
+        return;
+      }
+      input.value = String(value);
+    }
+
+    getActiveControlValue(key) {
+      const candidates = [
+        this.rangeInputs[key],
+        this.similarMergeInputs[key],
+        this.densityLimitInputs[key],
+        this.densityLimitNumberInputs[key],
+      ];
+      const activeInput = candidates.find((input) => this.isControlActive(input));
+      if (!activeInput) {
+        return null;
+      }
+      const parsed = safeNumber(activeInput.value, NaN);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    getDisplaySettingValue(key, settings = this.session.settings) {
+      const activeValue = this.getActiveControlValue(key);
+      if (activeValue !== null) {
+        return activeValue;
+      }
+      if (this.pendingSettingValues.has(key)) {
+        return this.pendingSettingValues.get(key);
+      }
+      return settings[key];
+    }
+
+    updateSettingValueText(key, value) {
+      if (key === "fontSize" && this.rowValues.fontSize) {
+        this.rowValues.fontSize.textContent = `${Math.round(value)}px`;
+      } else if (key === "displayRegionRatio" && this.rowValues.displayRegionRatio) {
+        this.rowValues.displayRegionRatio.textContent = `${Math.round(value * 100)}%`;
+      } else if (key === "opacity" && this.rowValues.opacity) {
+        this.rowValues.opacity.textContent = `${Math.round(value * 100)}%`;
+      } else if (key === "speed" && this.rowValues.speed) {
+        this.rowValues.speed.textContent = `${safeNumber(value, 1).toFixed(1)}x`;
+      } else if (key === "offset" && this.rowValues.offset) {
+        const offsetValue = safeNumber(value, 0);
+        this.rowValues.offset.textContent =
+          offsetValue === 0 ? "0.0s" : `${offsetValue > 0 ? "+" : ""}${offsetValue.toFixed(1)}s`;
+      } else if (key === "similarMergeThreshold" && this.similarMergeValues.similarMergeThreshold) {
+        this.similarMergeValues.similarMergeThreshold.textContent = `${Math.round(value * 100)}%`;
+      } else if (key === "similarMergeMinCount" && this.similarMergeValues.similarMergeMinCount) {
+        this.similarMergeValues.similarMergeMinCount.textContent = `>=${Math.round(value)}条`;
+      } else if (key === "similarMergeGapSeconds" && this.similarMergeValues.similarMergeGapSeconds) {
+        this.similarMergeValues.similarMergeGapSeconds.textContent = `${safeNumber(value, 0).toFixed(1)}s`;
+      } else if (key === "similarMergeMaxSpanSeconds" && this.similarMergeValues.similarMergeMaxSpanSeconds) {
+        this.similarMergeValues.similarMergeMaxSpanSeconds.textContent = `${safeNumber(value, 0).toFixed(0)}s`;
+      } else if (key === "maxEmitPerFrame" && this.densityLimitValues.maxEmitPerFrame) {
+        this.densityLimitValues.maxEmitPerFrame.textContent = `${Math.round(value)}条`;
+      } else if (key === "maxScheduledComments" && this.densityLimitValues.maxScheduledComments) {
+        this.densityLimitValues.maxScheduledComments.textContent = `${Math.round(value)}条`;
+      }
+    }
+
+    queueSettingUpdate(key, value) {
+      this.pendingSettingValues.set(key, value);
+      this.updateSettingValueText(key, value);
+      const existingTimer = this.pendingSettingTimers.get(key);
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+      const timer = window.setTimeout(() => {
+        this.pendingSettingTimers.delete(key);
+        if (!this.pendingSettingValues.has(key)) {
+          return;
+        }
+        const nextValue = this.pendingSettingValues.get(key);
+        this.pendingSettingValues.delete(key);
+        this.session.updateSetting(key, nextValue);
+      }, CONTROL_SETTING_DEBOUNCE_MS);
+      this.pendingSettingTimers.set(key, timer);
+    }
+
+    commitSettingUpdate(key, value) {
+      const timer = this.pendingSettingTimers.get(key);
+      if (timer) {
+        window.clearTimeout(timer);
+        this.pendingSettingTimers.delete(key);
+      }
+      this.pendingSettingValues.delete(key);
+      this.session.updateSetting(key, value);
+    }
+
+    clearPendingSettingUpdates() {
+      this.pendingSettingTimers.forEach((timer) => window.clearTimeout(timer));
+      this.pendingSettingTimers.clear();
+      this.pendingSettingValues.clear();
+    }
+
+    cancelPendingSettingUpdate(key) {
+      const timer = this.pendingSettingTimers.get(key);
+      if (timer) {
+        window.clearTimeout(timer);
+        this.pendingSettingTimers.delete(key);
+      }
+      this.pendingSettingValues.delete(key);
+    }
+
+    handleRangeSettingInput(key, input) {
+      const value = safeNumber(input.value, this.session.settings[key]);
+      this.queueSettingUpdate(key, value);
+    }
+
+    handleRangeSettingChange(key, input) {
+      this.commitSettingUpdate(key, safeNumber(input.value, this.session.settings[key]));
+    }
+
+    handleNumberSettingInput(key, input) {
+      const text = String(input.value || "").trim();
+      if (!text || text === "-" || text === "+") {
+        this.cancelPendingSettingUpdate(key);
+        return;
+      }
+      const value = safeNumber(text, NaN);
+      if (Number.isFinite(value)) {
+        this.queueSettingUpdate(key, value);
+      }
+    }
+
+    handleNumberSettingChange(key, input) {
+      const value = safeNumber(input.value, NaN);
+      if (Number.isFinite(value)) {
+        this.commitSettingUpdate(key, value);
+        return;
+      }
+      input.value = String(this.session.settings[key]);
+      this.updateSettingValueText(key, this.session.settings[key]);
+    }
+
     buildToolbar(parent) {
       this.toolbar = createElement("div", "anich-ddm-toolbar");
       this.toolbar.dataset.anichDdmToolbar = "true";
@@ -4576,7 +5503,10 @@
           range.step = String(SETTING_LIMITS[key].step);
           range.value = String(this.session.settings[key]);
           range.addEventListener("input", () => {
-            this.session.updateSetting(key, safeNumber(range.value, this.session.settings[key]));
+            this.handleRangeSettingInput(key, range);
+          });
+          range.addEventListener("change", () => {
+            this.handleRangeSettingChange(key, range);
           });
           this.rangeInputs[key] = range;
           row.append(labelNode, range, valueNode);
@@ -4617,10 +5547,133 @@
       const regexCard = this.buildEditorCard("blockedRegexes", "正则屏蔽", "支持 /pattern/flags 或普通表达式");
       this.regexErrors = createElement("div", "anich-ddm-error");
       regexCard.appendChild(this.regexErrors);
+      const similarMergeCard = this.buildSimilarMergeCard();
+      const densityLimitCard = this.buildDensityLimitCard();
 
-      section.append(modeCard, keywordCard, regexCard);
+      section.append(modeCard, similarMergeCard, densityLimitCard, keywordCard, regexCard);
       this.sections.filters = section;
       parent.appendChild(section);
+    }
+
+    buildSimilarMergeCard() {
+      const card = createElement("div", "anich-ddm-card");
+      card.appendChild(createElement("div", "anich-ddm-card-title", "相似合并"));
+
+      const enabledRow = createElement("label", "anich-ddm-row");
+      const enabledLabel = createElement("span", "", "启用");
+      const enabledValue = createElement("span", "anich-ddm-row-value");
+      const enabledInput = document.createElement("input");
+      enabledInput.type = "checkbox";
+      enabledInput.checked = !!this.session.settings.similarMergeEnabled;
+      enabledInput.addEventListener("change", () => {
+        this.session.updateSetting("similarMergeEnabled", enabledInput.checked);
+      });
+      this.similarMergeEnabledInput = enabledInput;
+      this.similarMergeValues.similarMergeEnabled = enabledValue;
+      const enabledSwitch = createElement("span", "anich-ddm-switch");
+      enabledSwitch.appendChild(enabledInput);
+      enabledRow.append(enabledLabel, enabledSwitch, enabledValue);
+      card.appendChild(enabledRow);
+
+      [
+        { key: "similarMergeThreshold", label: "相似度", format: (value) => `${Math.round(value * 100)}%` },
+        { key: "similarMergeMinCount", label: "最小数量", format: (value) => `>=${Math.round(value)}条` },
+        { key: "similarMergeGapSeconds", label: "相邻间隔", format: (value) => `${safeNumber(value, 0).toFixed(1)}s` },
+        { key: "similarMergeMaxSpanSeconds", label: "最大跨度", format: (value) => `${safeNumber(value, 0).toFixed(0)}s` },
+      ].forEach((item) => {
+        const limit = SETTING_LIMITS[item.key];
+        const row = createElement("label", "anich-ddm-row");
+        const labelNode = createElement("span", "", item.label);
+        const valueNode = createElement("span", "anich-ddm-row-value");
+        const range = document.createElement("input");
+        range.type = "range";
+        range.min = String(limit.min);
+        range.max = String(limit.max);
+        range.step = String(limit.step);
+        range.value = String(this.session.settings[item.key]);
+        range.addEventListener("input", () => {
+          this.handleRangeSettingInput(item.key, range);
+        });
+        range.addEventListener("change", () => {
+          this.handleRangeSettingChange(item.key, range);
+        });
+        this.similarMergeInputs[item.key] = range;
+        this.similarMergeValues[item.key] = valueNode;
+        row.append(labelNode, range, valueNode);
+        card.appendChild(row);
+      });
+      card.appendChild(createElement("div", "anich-ddm-card-note", "按动态区间合并相似弹幕：从第一条相似弹幕开始，到超过相邻间隔或最大跨度时结算。"));
+      return card;
+    }
+
+    buildDensityLimitCard() {
+      const card = createElement("div", "anich-ddm-card");
+      card.appendChild(createElement("div", "anich-ddm-card-title", "密度限制"));
+      const densityState = this.session.getDensityControlState();
+      [
+        { key: "maxEmitPerFrame", label: "同刻发送", format: (value) => `${Math.round(value)}条` },
+        { key: "maxScheduledComments", label: "最大加载", format: (value) => `${Math.round(value)}条` },
+      ].forEach((item) => {
+        const limit = densityState.bounds[item.key] || SETTING_LIMITS[item.key];
+        const row = createElement("label", "anich-ddm-row anich-ddm-row-density");
+        const labelNode = createElement("span", "", item.label);
+        const valueNode = createElement("span", "anich-ddm-row-value");
+        const range = document.createElement("input");
+        range.type = "range";
+        range.min = String(limit.min);
+        range.max = String(limit.max);
+        range.step = String(SETTING_LIMITS[item.key].step);
+        range.value = String(this.session.settings[item.key]);
+        range.addEventListener("input", () => {
+          this.handleRangeSettingInput(item.key, range);
+        });
+        range.addEventListener("change", () => {
+          this.handleRangeSettingChange(item.key, range);
+        });
+        const numberInput = document.createElement("input");
+        numberInput.className = "anich-ddm-number-input";
+        numberInput.type = "number";
+        numberInput.min = String(SETTING_LIMITS[item.key].min);
+        numberInput.max = String(SETTING_LIMITS[item.key].max);
+        numberInput.step = String(SETTING_LIMITS[item.key].step);
+        numberInput.value = String(this.session.settings[item.key]);
+        numberInput.addEventListener("input", () => {
+          this.handleNumberSettingInput(item.key, numberInput);
+        });
+        numberInput.addEventListener("change", () => {
+          this.handleNumberSettingChange(item.key, numberInput);
+        });
+        numberInput.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            numberInput.blur();
+          }
+        });
+        this.densityLimitInputs[item.key] = range;
+        this.densityLimitNumberInputs[item.key] = numberInput;
+        this.densityLimitValues[item.key] = valueNode;
+        row.append(labelNode, range, numberInput, valueNode);
+        card.appendChild(row);
+      });
+
+      const priorityRow = createElement("label", "anich-ddm-row");
+      const priorityLabel = createElement("span", "", "合并优先");
+      const priorityValue = createElement("span", "anich-ddm-row-value");
+      const priorityInput = document.createElement("input");
+      priorityInput.type = "checkbox";
+      priorityInput.checked = !!this.session.settings.densityPreferMergedComments;
+      priorityInput.addEventListener("change", () => {
+        this.session.updateSetting("densityPreferMergedComments", priorityInput.checked);
+      });
+      this.densityPreferMergedInput = priorityInput;
+      this.densityLimitValues.densityPreferMergedComments = priorityValue;
+      const prioritySwitch = createElement("span", "anich-ddm-switch");
+      prioritySwitch.appendChild(priorityInput);
+      priorityRow.append(priorityLabel, prioritySwitch, priorityValue);
+      card.appendChild(priorityRow);
+
+      card.appendChild(createElement("div", "anich-ddm-card-note", "同刻发送和最大加载会按当前视频时长互相约束。数字框可直接输入；开启合并优先后，密度裁剪会先保留合并计数弹幕，单条弹幕在超额时更早被丢弃。"));
+      return card;
     }
 
     buildEditorCard(key, title, placeholder) {
@@ -5197,22 +6250,57 @@
         this.enabledInput.checked = settings.enabled;
       }
       Object.entries(this.rangeInputs).forEach(([key, input]) => {
-        input.value = String(settings[key]);
+        this.syncInputValue(input, this.getDisplaySettingValue(key, settings));
       });
       this.rowValues.enabled.textContent = settings.enabled ? "开" : "关";
-      this.rowValues.fontSize.textContent = `${settings.fontSize}px`;
-      this.rowValues.displayRegionRatio.textContent = `${Math.round(settings.displayRegionRatio * 100)}%`;
-      this.rowValues.opacity.textContent = `${Math.round(settings.opacity * 100)}%`;
-      this.rowValues.speed.textContent = `${settings.speed.toFixed(1)}x`;
-      this.rowValues.offset.textContent =
-        session.settings.offset === 0
-          ? "0.0s"
-          : `${session.settings.offset > 0 ? "+" : ""}${session.settings.offset.toFixed(1)}s`;
+      ["fontSize", "displayRegionRatio", "opacity", "speed", "offset"].forEach((key) => {
+        this.updateSettingValueText(key, this.getDisplaySettingValue(key, settings));
+      });
       MODE_KEYS.forEach((mode) => {
         if (this.modeInputs[mode]) {
           this.modeInputs[mode].checked = !settings.blockedModes[mode];
         }
       });
+      if (this.similarMergeEnabledInput) {
+        this.similarMergeEnabledInput.checked = !!settings.similarMergeEnabled;
+      }
+      Object.entries(this.similarMergeInputs).forEach(([key, input]) => {
+        this.syncInputValue(input, this.getDisplaySettingValue(key, settings));
+      });
+      if (this.similarMergeValues.similarMergeEnabled) {
+        this.similarMergeValues.similarMergeEnabled.textContent = settings.similarMergeEnabled ? "开" : "关";
+      }
+      [
+        "similarMergeThreshold",
+        "similarMergeMinCount",
+        "similarMergeGapSeconds",
+        "similarMergeMaxSpanSeconds",
+      ].forEach((key) => {
+        this.updateSettingValueText(key, this.getDisplaySettingValue(key, settings));
+      });
+      const densityState = session.getDensityControlState();
+      Object.entries(this.densityLimitInputs).forEach(([key, input]) => {
+        const limit = densityState.bounds[key] || SETTING_LIMITS[key];
+        input.min = String(limit.min);
+        input.max = String(limit.max);
+        input.step = String(SETTING_LIMITS[key].step);
+        this.syncInputValue(input, this.getDisplaySettingValue(key, settings));
+      });
+      Object.entries(this.densityLimitNumberInputs).forEach(([key, input]) => {
+        input.min = String(SETTING_LIMITS[key].min);
+        input.max = String(SETTING_LIMITS[key].max);
+        input.step = String(SETTING_LIMITS[key].step);
+        this.syncInputValue(input, this.getDisplaySettingValue(key, settings));
+      });
+      if (this.densityPreferMergedInput) {
+        this.densityPreferMergedInput.checked = !!settings.densityPreferMergedComments;
+      }
+      ["maxEmitPerFrame", "maxScheduledComments"].forEach((key) => {
+        this.updateSettingValueText(key, this.getDisplaySettingValue(key, settings));
+      });
+      if (this.densityLimitValues.densityPreferMergedComments) {
+        this.densityLimitValues.densityPreferMergedComments.textContent = settings.densityPreferMergedComments ? "开" : "关";
+      }
       if (this.apiInput) {
         this.apiInput.value = session.transport.getConfig().customApiPrefix || "";
       }
@@ -5250,9 +6338,12 @@
 
       const context = session.resolvePageContext();
       const transportConfig = session.transport.getConfig();
+      const densityDurationText = densityState.durationSeconds ? ` | 时长 ${formatClockTime(densityState.durationSeconds)}` : "";
       const summaryLines = [
         `已加载: ${session.store.stats.count} | 可见: ${session.store.stats.visibleCount} | 已屏蔽: ${session.store.stats.filteredCount}`,
         `来源桶: ${summarizeSourceBreakdown(session.store.stats.sourceBreakdown)}`,
+        `相似合并: ${settings.similarMergeEnabled ? "开" : "关"} | 输出 ${safeNumber(session.similarMergeStats?.outputCount, 0)} / 输入 ${safeNumber(session.similarMergeStats?.inputCount, 0)} | 合并组 ${safeNumber(session.similarMergeStats?.groups, 0)} | 折叠 ${safeNumber(session.similarMergeStats?.collapsedCount, 0)} 条`,
+        `密度限制: 调度 ${safeNumber(session.densityLimitStats?.outputCount, 0)} / ${safeNumber(session.densityLimitStats?.inputCount, 0)} | 裁剪 ${safeNumber(session.densityLimitStats?.droppedCount, 0)} | 同刻 ${Math.round(settings.maxEmitPerFrame)} 条${densityDurationText} | 合并优先 ${settings.densityPreferMergedComments ? "开" : "关"}`,
         `显示区域: ${Math.round(settings.displayRegionRatio * 100)}% (仅滚动弹幕)`,
         `已启用类型: ${MODE_KEYS.filter((mode) => !settings.blockedModes[mode]).map((mode) => MODE_LABELS[mode]).join(" / ") || "无"}`,
         `关键词规则: ${settings.blockedKeywords.length} 条`,
@@ -5284,6 +6375,9 @@
       this.token = app.nextToken();
       this.destroyed = false;
       this.settings = normalizeSettings(storageGet(SETTINGS_KEY, DEFAULT_SETTINGS));
+      if (!storageGetBoolean(SIMILAR_MERGE_OPT_IN_KEY, false)) {
+        this.settings.similarMergeEnabled = false;
+      }
       this.transport = app.transport;
       this.bilibiliTransport = app.bilibiliTransport;
       this.store = new DanmakuStore();
@@ -5302,7 +6396,11 @@
       this.lastEndpoint = null;
       this.cachedContext = null;
       this.invalidRegexes = [];
+      this.similarMergeStats = makeSimilarMergeStats(getSimilarMergeConfig(this.settings), 0, 0, 0, 0);
+      this.densityLimitStats = makeDensityLimitStats(getDensityLimitConfig(this.settings), 0, 0);
+      this.densityCandidateComments = [];
       this.bilibiliImport = this.getPendingBilibiliImportState();
+      this.handleVideoDurationChange = this.handleVideoDurationChange.bind(this);
     }
 
     makeAbortController() {
@@ -5346,29 +6444,99 @@
       this.renderer.destroy();
       this.skipPrompt.destroy();
       this.panel.destroy();
+      this.detachVideoDensityListeners(this.video);
       this.video = null;
       this.playerContainer = null;
       this.cachedContext = null;
+    }
+
+    getDensityDurationSeconds() {
+      const videoDuration = normalizeDensityDurationSeconds(this.video?.duration);
+      return videoDuration || getCommentTimelineDurationSeconds(this.store.items);
+    }
+
+    getDensityControlState(comments = this.densityCandidateComments) {
+      return resolveDensityLimitSettings(this.settings, this.getDensityDurationSeconds(), null, comments);
+    }
+
+    applyDensityDurationConstraints(changedKey = null, comments = this.densityCandidateComments) {
+      const previousEmit = this.settings.maxEmitPerFrame;
+      const previousScheduled = this.settings.maxScheduledComments;
+      const resolved = resolveDensityLimitSettings(
+        this.settings,
+        this.getDensityDurationSeconds(),
+        changedKey,
+        comments
+      );
+      this.settings = resolved.settings;
+      return (
+        previousEmit !== this.settings.maxEmitPerFrame ||
+        previousScheduled !== this.settings.maxScheduledComments
+      );
+    }
+
+    attachVideoDensityListeners(video) {
+      if (!video) {
+        return;
+      }
+      video.addEventListener("loadedmetadata", this.handleVideoDurationChange);
+      video.addEventListener("durationchange", this.handleVideoDurationChange);
+    }
+
+    detachVideoDensityListeners(video) {
+      if (!video) {
+        return;
+      }
+      video.removeEventListener("loadedmetadata", this.handleVideoDurationChange);
+      video.removeEventListener("durationchange", this.handleVideoDurationChange);
+    }
+
+    handleVideoDurationChange() {
+      if (this.destroyed) {
+        return;
+      }
+      const changed = this.applyDensityDurationConstraints(null);
+      if (changed && this.store.stats.count) {
+        this.refreshVisibleComments({ clearOverlay: false });
+        return;
+      }
+      this.panel.update();
     }
 
     bindVideo(video) {
       if (!video) {
         return;
       }
-      const isSameVideo = this.video === video;
+      const previousVideo = this.video;
+      const isSameVideo = previousVideo === video;
+      if (previousVideo && !isSameVideo) {
+        this.detachVideoDensityListeners(previousVideo);
+      }
       this.video = video;
+      if (!isSameVideo) {
+        this.attachVideoDensityListeners(video);
+      }
+      const densityChanged = this.applyDensityDurationConstraints(null);
       this.playerContainer = video.closest("section[player]") || video.parentElement || video;
       if (isSameVideo) {
         this.skipPrompt.attach(this.playerContainer);
         this.panel.attach(this.playerContainer, this.renderer.overlay);
-        this.panel.update();
+        if (densityChanged && this.store.stats.count) {
+          this.refreshVisibleComments({ clearOverlay: false });
+        } else {
+          this.panel.update();
+        }
         return;
       }
       this.renderer.attach(this.playerContainer);
       this.skipPrompt.attach(this.playerContainer);
       this.panel.attach(this.playerContainer, this.renderer.overlay);
       this.scheduler.setVideo(video);
-      this.panel.update();
+      if (densityChanged && this.store.stats.count) {
+        this.refreshVisibleComments({ clearOverlay: false });
+      } else {
+        this.panel.update();
+      }
     }
 
     saveSettings() {
@@ -5377,15 +6545,33 @@
     }
 
     updateSetting(key, value) {
+      let densityChangedKey = null;
       if (key === "enabled") {
         this.settings.enabled = !!value;
+      } else if (key === "similarMergeEnabled") {
+        this.settings.similarMergeEnabled = !!value;
+        storageSet(SIMILAR_MERGE_OPT_IN_KEY, !!value);
+      } else if (key === "densityPreferMergedComments") {
+        this.settings.densityPreferMergedComments = !!value;
       } else if (key === "blockedKeywords" || key === "blockedRegexes") {
         this.settings[key] = normalizeStringList(value);
       } else if (key === "blockedModes") {
         this.settings.blockedModes = Object.assign({}, this.settings.blockedModes, value || {});
       } else {
         const limit = SETTING_LIMITS[key];
+        if (!limit) {
+          return;
+        }
         this.settings[key] = clamp(safeNumber(value, this.settings[key]), limit.min, limit.max);
+        if (key === "similarMergeMinCount" || key === "maxEmitPerFrame" || key === "maxScheduledComments") {
+          this.settings[key] = Math.round(this.settings[key]);
+        }
+        if (key === "maxEmitPerFrame" || key === "maxScheduledComments") {
+          densityChangedKey = key;
+        }
+      }
+      if (densityChangedKey) {
+        this.applyDensityDurationConstraints(densityChangedKey);
       }
       this.saveSettings();
       this.refreshVisibleComments();
@@ -5402,14 +6588,36 @@
 
     refreshVisibleComments(options = {}) {
       const { clearOverlay = true } = options;
+      this.applyDensityDurationConstraints(null);
       const filterResult = applyCommentFilters(this.store.items, this.settings);
+      let scheduledComments = filterResult.comments;
+      let mergeStats = makeSimilarMergeStats(
+        getSimilarMergeConfig(this.settings),
+        filterResult.comments.length,
+        filterResult.comments.length,
+        0,
+        0
+      );
+      try {
+        const mergeResult = mergeSimilarDanmaku(filterResult.comments, this.settings);
+        scheduledComments = mergeResult.comments;
+        mergeStats = mergeResult.stats;
+      } catch (error) {
+        console.warn("[AniChDanmaku] Similar merge skipped:", error);
+      }
+      this.densityCandidateComments = scheduledComments;
+      this.applyDensityDurationConstraints(null, scheduledComments);
+      const limitResult = limitScheduledDanmaku(scheduledComments, this.settings, this.getDensityDurationSeconds());
+      scheduledComments = limitResult.comments;
       this.invalidRegexes = filterResult.invalidRegexes;
       this.store.setVisibilityStats(filterResult.comments.length);
       if (clearOverlay) {
         this.renderer.clear();
       }
       this.scheduler.setSkipCue(findFirstSkipCue(this.store.items));
-      this.scheduler.setComments(filterResult.comments);
+      this.similarMergeStats = mergeStats;
+      this.densityLimitStats = limitResult.stats;
+      this.scheduler.setComments(scheduledComments);
       this.panel.update();
     }
 
@@ -6953,6 +8161,9 @@
                 store: this.activeSession.store.stats,
                 endpoint: this.activeSession.lastEndpoint,
                 settings: this.activeSession.settings,
+                similarMerge: this.activeSession.similarMergeStats,
+                densityLimit: this.activeSession.densityLimitStats,
+                schedulerDensity: this.activeSession.scheduler.getDensityDebugState(),
                 invalidRegexes: this.activeSession.invalidRegexes,
                 imports: {
                   bilibili: this.activeSession.getBilibiliImportDebugState(),

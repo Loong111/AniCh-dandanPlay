@@ -19,6 +19,8 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - External toolbar placed outside the player so the video area stays unobstructed.
 - Adjustable font size, display region, opacity, speed, and time offset.
 - Filter controls for danmaku mode, keywords, and regular expressions.
+- Dynamic similar-comment merge with adjustable similarity threshold, minimum count, adjacent gap, and maximum span, displayed as counted comments such as `commentx10`.
+- High-density protection with local-density-constrained max same-moment emits and max scheduled comments after similar merge, adjustable by slider or numeric input.
 - Cached match preferences and toolbar position persisted in `localStorage`.
 - Fullscreen, seek, pause/resume, route change, and player rebuild rebinding logic.
 
@@ -42,7 +44,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 4. Adjust basic options such as font size, display region, opacity, speed, and offset.
 5. If auto-match fails, open `Match / Source`, run a manual search, choose an episode, and confirm the match.
 6. Hover the toolbar settings button to import Bilibili danmaku from a BV/video link, `b23` link, or bangumi `ep` link.
-7. Use keyword or regex filters when you want to hide specific comments.
+7. Use keyword or regex filters when you want to hide specific comments, or adjust similar-comment merge from the `Filters` tab when dense repeated comments should be collapsed.
 
 ## Configuration Notes
 
@@ -50,6 +52,9 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - A custom API prefix can be configured from the panel if you want to route requests through your own Dandanplay-compatible endpoint.
 - Built-in proxy candidates are used automatically when direct access is unavailable.
 - Bilibili import bindings are stored per AniCh route, while BV `?p=` and bangumi `ep` inputs can seed season-level restore chains.
+- Similar-comment merge can be manually enabled from the panel with `80%` default similarity, minimum count `2`, adjacent gap `5s`, and maximum span `18s`; all four values are adjustable from the panel.
+- Density limits default to `12` same-moment emits and `5000` scheduled comments after similar merge; once comments are available, the two values are coupled by one-second local density buckets so dense seconds are capped and sparse seconds only count their actual comments.
+- The optional `Merge first` density mode keeps merged counted comments ahead of unmerged comments when max-load or same-moment limits have to drop items.
 
 ## Project Structure
 
@@ -73,4 +78,4 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 
 ## Status
 
-Core Dandanplay-based danmaku features are implemented. Bilibili multi-import and season-chain restore are in Phase 6, with live browser verification still pending for the newest import paths.
+Core Dandanplay-based danmaku features are implemented. The newest Bilibili import paths and Phase 7 density/similar-merge behavior still need live browser verification.

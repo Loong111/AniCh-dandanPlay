@@ -53,4 +53,13 @@ graph TD
         T15 --> T16
         T16 --> T17
     end
+
+    subgraph Phase7 [Phase 7: Similar Danmaku Merge]
+        T18[Task 18: Merge Core + Settings Contract]
+        T19[Task 19: Settings UI + Debug + Docs]
+        T20[Task 20: Static + Manual Verification]
+        T16 --> T18
+        T18 --> T19
+        T19 --> T20
+    end
 ```

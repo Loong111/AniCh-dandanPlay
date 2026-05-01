@@ -121,6 +121,9 @@ Before marking any task as complete, verify ALL of the following:
 - Per-link clear removes only the selected binding plus that chain's derived route entries; a route-level clear-all may remove every active Bilibili binding on the current AniCh route without touching unrelated explicit imports on other routes.
 - If a derived chain currently points at a missing `p`, skip that chain for the current visit but keep the chain cached so later AniCh visits can auto-restore once the Bilibili side has that page.
 - Keep `SkipCue` derived from normalized comments as a separate side-channel; do not fold click behavior into `Renderer`.
+- Keep similar-danmaku merge as a display-only side-channel after filtering and before scheduling; do not mutate `DanmakuStore` source buckets or feed merged text into `SkipCue`.
+- Similar merge and density settings must remain persisted under `anichDanmaku:settings`, including enable, threshold, minimum count, adjacent gap, maximum span, max same-moment emits, max scheduled comments, and the merge-priority density toggle.
+- Local-density coupling belongs in `Session`; renderer and source stores must not know about one-second density bucket limits.
 - Hide native `section[danmaku]` and native danmaku input/control entry points in the custom runtime.
 - Do not implement danmaku sending in v1.
 

@@ -1,8 +1,8 @@
 # Task Breakdown
 
 ## Overview
-- **Total Phases**: 6
-- **Total Tasks**: 17
+- **Total Phases**: 7
+- **Total Tasks**: 20
 - **Estimated Total Effort**: XL
 
 ## S.U.P.E.R Design Constraints
@@ -111,3 +111,19 @@
 | Lane | Tasks | Combined Effort | Merge Risk | Key Files |
 |:-----|:------|:----------------|:-----------|:----------|
 | A | 13, 14, 15, 16 | L | Medium | `anich-danmaku-fix.user.js`, `docs/plan/task-breakdown.md`, `docs/plan/dependency-graph.md`, `docs/plan/milestones.md`, `docs/progress/MASTER.md`, `docs/progress/phase-6-bilibili-import.md`, `.codex/skills/anich-danmaku-takeover-dev/SKILL.md` |
+
+## Phase 7: Similar Danmaku Merge
+**Goal**: Collapse similar visible comments into counted display comments such as `弹幕x10` using dynamic burst intervals instead of fixed global time buckets.
+**Prerequisite**: Phase 2 data/rendering complete; can proceed after Phase 6 implementation because Bilibili import source buckets already merge into the normalized store.
+**S.U.P.E.R Focus**: `S`, `U`, `P`, `R`
+
+| # | Task | Priority | Effort | Depends On | Lane | S.U.P.E.R | Acceptance Criteria |
+|:--|:-----|:---------|:-------|:-----------|:-----|:----------|:--------------------|
+| 18 | Implement pure similar-merge helpers and settings contract | P0 | M | 16 | A | S, U, P, R | Visible comments are clustered after filtering and before scheduling; dynamic intervals start at the first similar comment and close at the last similar comment before inactivity/max-span limits; defaults are enabled, `80%` threshold, `>=2` min count, `5s` gap, and `18s` max span |
+| 19 | Add settings UI, debug stats, density controls, and documentation for merge controls | P0 | S | 18 | A | S, E, R | Settings panel exposes enable, similarity threshold, min count, adjacent gap, max span, max same-moment emits, max scheduled comments, local-density coupling, numeric density inputs, debounced slider commits, and merge-priority density drops; settings persist under `anichDanmaku:settings`; debug stats report merge and density-limit counts |
+| 20 | Run static checks and user manual verification for merged playback | P1 | S | 19 | A | U, R | `node --check` passes; live playback confirms similar bursts render as counted comments, threshold/min-count/gap/span/max-emit/max-load controls take effect, filters apply before counts, seek/offset/fullscreen remain stable, and SkipCue still uses original comments |
+
+### Parallel Lanes
+| Lane | Tasks | Combined Effort | Merge Risk | Key Files |
+|:-----|:------|:----------------|:-----------|:----------|
+| A | 18, 19, 20 | M | Medium | `anich-danmaku-fix.user.js`, `README.md`, `README_cn.md`, `docs/analysis/similar-danmaku-merge.md`, `docs/progress/phase-7-similar-danmaku-merge.md`, `docs/progress/MASTER.md`, `.codex/skills/anich-danmaku-takeover-dev/SKILL.md` |

@@ -8,6 +8,7 @@
 - [Project Overview](../analysis/project-overview.md)
 - [Module Inventory](../analysis/module-inventory.md)
 - [Risk Assessment](../analysis/risk-assessment.md)
+- [Similar Danmaku Merge Analysis](../analysis/similar-danmaku-merge.md)
 - [Task Breakdown](../plan/task-breakdown.md)
 - [Dependency Graph](../plan/dependency-graph.md)
 - [Milestones](../plan/milestones.md)
@@ -22,6 +23,7 @@
 | 4 | Control Corrections | 2 | 2 | 100% |
 | 5 | Skip Cue Prompt | 2 | 2 | 100% |
 | 6 | Bilibili Import Overlay | 5 | 4 | 80% |
+| 7 | Similar Danmaku Merge | 3 | 2 | 67% |
 
 ## Phase Checklist
 - [x] Phase 1: foundation (3/3 tasks) — [details](./phase-1-foundation.md)
@@ -30,16 +32,18 @@
 - [x] Phase 4: control-corrections (2/2 tasks) — [details](./phase-4-native-control-enhancements.md)
 - [x] Phase 5: skip-cue-prompt (2/2 tasks) — [details](./phase-5-skip-cue-prompt.md)
 - [ ] Phase 6: bilibili-import-overlay (4/5 tasks) — [details](./phase-6-bilibili-import.md)
+- [ ] Phase 7: similar-danmaku-merge (2/3 tasks) — [details](./phase-7-similar-danmaku-merge.md)
 
 ## Current Status
-**Active Phase**: Phase 6 — Bilibili Import Overlay
-**Active Task**: Task 6.5 — live playback verification for multi-link, BV `?p=`, and Bilibili bangumi `ep` import chains
-**Blockers**: Live AniCh/userscript-manager verification remains user-owned; local syntax and Bilibili endpoint probes pass
+**Active Phase**: Phase 7 — Similar Danmaku Merge
+**Active Task**: Task 7.3 — live playback verification for similar danmaku merge controls and counted rendering
+**Blockers**: Live AniCh/userscript-manager verification remains user-owned; Phase 6 live multi-import verification is still pending
 
 ## Next Steps
-1. Re-run the live AniCh import flow with multiple Bilibili links, confirming the popover keeps independent draft/input state and per-link `移除` works.
-2. Verify one normal BV `?p=` chain and one Bilibili bangumi `ep` chain can auto-restore on later AniCh episodes and merge with Dandanplay comments.
-3. Re-run the broader playback checklist for clear-all, seek, pause/resume, fullscreen, filtering, SkipCue, and route teardown.
+1. Verify v2.6.6 on the high-danmaku episode and confirm sliders drag smoothly, numeric inputs support delete/type/paste/arrow changes, and `同刻发送` / `最大加载` are coupled by one-second local density instead of whole-episode duration.
+2. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
+3. Then enable similar merge manually and confirm `相似度`、`最小数量`、`相邻间隔`、`最大跨度` controls change merge behavior after seek/refresh.
+4. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
 
 ## Session Log
 | Date | Session | Summary |
@@ -60,3 +64,11 @@
 | 2026-04-24 | 14 | Fixed the Bilibili import debug/popover state so a failed second import keeps its own BV/P context instead of reverting to the first cached link, hardened per-link remove click handling, and recorded a local state-harness regression check plus syntax validation |
 | 2026-04-25 | 15 | Confirmed the core multi-binding save path still reaches 2 records under stubbed transport, traced the live regression to the popover auto-refilling the first saved URL over a non-empty second draft on panel refresh, patched that overwrite condition, and added a targeted ControlPanel state regression check plus syntax validation |
 | 2026-04-30 | 16 | Added Bilibili bangumi `ep` import support with PGC metadata resolution, season/episode-number chain derivation, PGC source records, updated Phase 6 docs, and local syntax plus Bilibili endpoint probes |
+| 2026-04-30 | 17 | Added Phase 7 planning for similar danmaku merge with user-confirmed adjustable min-count, adjacent-gap, and max-span settings |
+| 2026-04-30 | 18 | Implemented similar danmaku merge in v2.6.0 with settings controls, debug stats, README updates, project skill guidance, passing `node --check`, and a VM helper probe for cluster behavior |
+| 2026-04-30 | 19 | Responded to the v2.6.0 AniCh playback regression by changing similar merge to opt-in by default in v2.6.1, ignoring accidental pre-hotfix enabled state unless the new opt-in key is present, adding a guarded fallback around the merge stage, and validating syntax, diff whitespace, boot, and helper behavior |
+| 2026-04-30 | 20 | Added v2.6.2 fullscreen click-through hardening after user reported a high-danmaku episode creates an apparent overlay that blocks pause/shrink clicks while lower-count episodes behave normally |
+| 2026-04-30 | 21 | Added v2.6.3 density controls for max same-moment emits and max post-merge scheduled comments to handle extremely high-danmaku episodes without unbounded DOM bursts |
+| 2026-04-30 | 22 | Added v2.6.4 duration-aware density coupling, numeric density inputs, and an initial density-priority toggle, with syntax and helper probes passing |
+| 2026-04-30 | 23 | Corrected the density priority switch in v2.6.5 so `合并优先` preserves merged counted comments and drops single comments first |
+| 2026-04-30 | 24 | Added v2.6.6 control smoothing with debounced slider commits, editable numeric inputs that are not overwritten during refresh, and local one-second density coupling |
