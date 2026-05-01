@@ -99,8 +99,8 @@ Add a filter/settings card named `相似合并`:
 Add a separate settings card named `密度限制`:
 
 - slider: `同刻发送`, default `12条`
-- slider: `最大加载`, default `5000条`
-- number input for both density values, with one-second local-density mutual constraints once comments are known
+- slider: `最大加载`, default `10000条`
+- number input for both density values; `同刻发送` controls one-second peak shaving and `最大加载` is an independent global cap
 - switch: `合并优先`, default off; when enabled, density limiting preserves merged counted comments first and drops unmerged single comments before them
 
 Expose debug stats under `window.__anichDanmaku__.getStats()`:
@@ -121,13 +121,12 @@ Also expose density stats:
 ```js
 densityLimit: {
   maxEmitPerFrame: 12,
-  maxScheduledComments: 5000,
+  maxScheduledComments: 10000,
   preferMergedComments: false,
-  durationSeconds: 1440,
   bucketSeconds: 1,
   inputCount: 8200,
-  outputCount: 5000,
-  droppedCount: 3200,
+  outputCount: 7600,
+  droppedCount: 600,
   droppedMergedCount: 1200,
   droppedSingleCount: 2000
 }
@@ -146,8 +145,9 @@ densityLimit: {
 - Very dense comment sections can increase comparison cost. Active-cluster pruning by inactivity gap keeps comparisons bounded to the local burst window.
 - Extremely dense timelines can still overload DOM animation if too many comments share one playback instant. Mitigate with `maxEmitPerFrame`, which caps both one-second schedule buckets and final per-frame emits.
 - Very large merged lists can still be expensive to schedule. Mitigate with `maxScheduledComments`, which remains a global cap after local one-second density caps have been applied.
-- Local-density constraints keep `maxScheduledComments` and `maxEmitPerFrame` consistent after candidate comments are known: the maximum load is `sum(min(commentsInSecond, maxEmitPerFrame))`, so dense seconds are capped while sparse seconds contribute only their actual count.
+- Local-density peak shaving applies `maxEmitPerFrame` per one-second candidate-comment bucket: dense seconds are capped while sparse seconds pass through intact. `maxScheduledComments` is independent and only acts as a final global cap.
 - The optional `合并优先` mode treats merged display comments as higher priority during density drops, preserving counted comments before unmerged single comments.
+- Source-level overlap between built-in proxy and Bilibili import is handled before filtering/merge: exact duplicates are removed by fingerprint, and later source buckets also use a same-text/type `0.2s` fuzzy duplicate window. Source summaries expose raw, accepted, and deduped counts when drops occur.
 - Merging after filters means filtered comments do not contribute to counts. This is the recommended behavior because the count should represent visible comments.
 
 ## Confirmed Defaults

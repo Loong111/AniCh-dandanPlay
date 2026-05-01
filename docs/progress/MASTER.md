@@ -2,7 +2,7 @@
 
 > **Task**: Deliver and maintain an AniCh-specific Dandanplay danmaku userscript.
 > **Started**: 2026-04-19
-> **Last Updated**: 2026-04-30
+> **Last Updated**: 2026-05-02
 
 ## References
 - [Project Overview](../analysis/project-overview.md)
@@ -40,10 +40,11 @@
 **Blockers**: Live AniCh/userscript-manager verification remains user-owned; Phase 6 live multi-import verification is still pending
 
 ## Next Steps
-1. Verify v2.6.6 on the high-danmaku episode and confirm sliders drag smoothly, numeric inputs support delete/type/paste/arrow changes, and `同刻发送` / `最大加载` are coupled by one-second local density instead of whole-episode duration.
-2. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
-3. Then enable similar merge manually and confirm `相似度`、`最小数量`、`相邻间隔`、`最大跨度` controls change merge behavior after seek/refresh.
-4. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
+1. Verify v2.6.8 on the high-danmaku episode and confirm `最大加载` defaults to `10000` and no longer changes when `同刻发送` changes.
+2. Confirm `同刻发送` only shaves dense one-second buckets while sparse segments keep all comments.
+3. Confirm Bilibili imports use cross-source `0.2s` fuzzy dedupe for overlapping sources, and compare source bucket raw/accepted/deduped counts with `已加载` and merge input counts.
+4. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
+5. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
 
 ## Session Log
 | Date | Session | Summary |
@@ -72,3 +73,5 @@
 | 2026-04-30 | 22 | Added v2.6.4 duration-aware density coupling, numeric density inputs, and an initial density-priority toggle, with syntax and helper probes passing |
 | 2026-04-30 | 23 | Corrected the density priority switch in v2.6.5 so `合并优先` preserves merged counted comments and drops single comments first |
 | 2026-04-30 | 24 | Added v2.6.6 control smoothing with debounced slider commits, editable numeric inputs that are not overwritten during refresh, and local one-second density coupling |
+| 2026-05-02 | 25 | Added v2.6.7 max-load decoupling, 10000 default max-load, local peak-only same-moment limiting, and removed cross-source fuzzy dedupe that suppressed imported Bilibili comments |
+| 2026-05-02 | 26 | Added v2.6.8 cross-source 0.2s fuzzy dedupe restoration, preserved raw one-second peak summary stats, and made source bucket raw/accepted/deduped counts visible |

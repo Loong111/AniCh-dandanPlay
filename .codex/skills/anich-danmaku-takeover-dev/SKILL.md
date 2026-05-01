@@ -116,6 +116,7 @@ Before marking any task as complete, verify ALL of the following:
 - Keep the Dandanplay comment payload normalized before it reaches store, scheduler, renderer, or skip-cue logic.
 - Keep imported Bilibili comments normalized into the same `NormalizedDanmaku` contract before they enter `DanmakuStore`.
 - Preserve one source bucket per imported Bilibili binding using stable keys such as `import:bilibili:<bindingKey>`; refreshing the same binding updates that bucket in place, while different bindings may coexist and merge.
+- Preserve cross-source duplicate suppression before filtering and merging: exact fingerprints always dedupe, and later source buckets use a same-text/type `0.2s` fuzzy duplicate window against earlier accepted source comments.
 - Preserve route-scoped Bilibili import collections and season-scoped chain collections separately; restore precedence applies per chain as `explicit route binding > derived route binding > live chain derivation`, and all matching chains merge on the target AniCh episode unless the user explicitly asks for a priority model.
 - Bilibili PGC bangumi `ep` links must resolve through `pgc/view/web/season` and derive by `season_id + episode number offset`, not raw `ep_id + n`, because official Bilibili `ep_id` values may stop being consecutive mid-season.
 - Per-link clear removes only the selected binding plus that chain's derived route entries; a route-level clear-all may remove every active Bilibili binding on the current AniCh route without touching unrelated explicit imports on other routes.
@@ -123,7 +124,7 @@ Before marking any task as complete, verify ALL of the following:
 - Keep `SkipCue` derived from normalized comments as a separate side-channel; do not fold click behavior into `Renderer`.
 - Keep similar-danmaku merge as a display-only side-channel after filtering and before scheduling; do not mutate `DanmakuStore` source buckets or feed merged text into `SkipCue`.
 - Similar merge and density settings must remain persisted under `anichDanmaku:settings`, including enable, threshold, minimum count, adjacent gap, maximum span, max same-moment emits, max scheduled comments, and the merge-priority density toggle.
-- Local-density coupling belongs in `Session`; renderer and source stores must not know about one-second density bucket limits.
+- Local-density peak shaving belongs in `Session`; renderer and source stores must not know about one-second density bucket limits. `maxScheduledComments` remains an independent global cap and must not be derived from source count, episode duration, or `maxEmitPerFrame`.
 - Hide native `section[danmaku]` and native danmaku input/control entry points in the custom runtime.
 - Do not implement danmaku sending in v1.
 

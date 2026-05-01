@@ -12,7 +12,7 @@
 - [x] **Task 7.2**: Add settings UI, debug stats, density controls, and documentation for merge controls
   - Priority: P0
   - Effort: S
-  - Acceptance: Settings panel exposes enable, similarity threshold, min count, adjacent gap, max span, max same-moment emits, max scheduled comments, numeric density inputs, one-second local-density constraints, and the optional merge-priority density mode; settings persist under `anichDanmaku:settings`; debug stats report merge and density-limit counts.
+  - Acceptance: Settings panel exposes enable, similarity threshold, min count, adjacent gap, max span, max same-moment emits, independent max scheduled comments, numeric density inputs, one-second local-density peak shaving, and the optional merge-priority density mode; settings persist under `anichDanmaku:settings`; debug stats report merge and density-limit counts.
   - Notes: Keep `NormalizedDanmaku` renderer compatibility by producing display comments with the same core fields plus optional `merged*` debug metadata.
 - [ ] **Task 7.3**: Run static checks and user manual verification for merged playback
   - Priority: P1
@@ -34,6 +34,8 @@
 - Density-control follow-up: v2.6.3 adds settings for max same-moment emits and max scheduled comments after similar merge. Scheduler now drops due comments beyond the per-frame emit limit instead of building an unbounded DOM burst, while the post-merge schedule list can be evenly capped across the whole episode.
 - Density-control refinement: v2.6.5 makes same-moment emits and max scheduled comments mutually constrained by video/comment duration, adds direct numeric inputs beside the sliders, and adds an opt-in `合并优先` mode that preserves merged counted comments before unmerged single comments during density limiting.
 - Control and density refinement: v2.6.6 debounces slider commits so dragging does not rerun filtering/scheduling on every input event, avoids overwriting focused numeric inputs during panel refresh, and changes density coupling to one-second candidate-comment buckets so sparse seconds do not receive artificial capacity from the full episode duration.
+- Density and import-source correction: v2.6.7 decouples max scheduled comments from same-moment emits, changes the default max scheduled comments to 10000, keeps same-moment emits as one-second local peak shaving, and briefly removed cross-source fuzzy dedupe while investigating source-bucket accounting.
+- Cross-source dedupe correction: v2.6.8 restores the 0.2s same-text/type fuzzy duplicate window for later source buckets, keeps the raw one-second peak statistic visible in the runtime summary, and expands source-bucket summaries with raw, accepted, and deduped counts.
 
 ## Phase Completion Checklist
 - [x] Task 7.1 complete with S.U.P.E.R boundaries preserved

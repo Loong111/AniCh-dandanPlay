@@ -20,7 +20,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - Adjustable font size, display region, opacity, speed, and time offset.
 - Filter controls for danmaku mode, keywords, and regular expressions.
 - Dynamic similar-comment merge with adjustable similarity threshold, minimum count, adjacent gap, and maximum span, displayed as counted comments such as `commentx10`.
-- High-density protection with local-density-constrained max same-moment emits and max scheduled comments after similar merge, adjustable by slider or numeric input.
+- High-density protection with local-density peak shaving for same-moment emits and an independent global max-load cap after similar merge, adjustable by slider or numeric input.
 - Cached match preferences and toolbar position persisted in `localStorage`.
 - Fullscreen, seek, pause/resume, route change, and player rebuild rebinding logic.
 
@@ -52,8 +52,9 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - A custom API prefix can be configured from the panel if you want to route requests through your own Dandanplay-compatible endpoint.
 - Built-in proxy candidates are used automatically when direct access is unavailable.
 - Bilibili import bindings are stored per AniCh route, while BV `?p=` and bangumi `ep` inputs can seed season-level restore chains.
+- Bilibili imports are deduped against earlier sources by exact fingerprint, plus a cross-source fuzzy check for same text/type comments within `0.2s`; the runtime source summary reports raw, accepted, and deduped counts when drops happen.
 - Similar-comment merge can be manually enabled from the panel with `80%` default similarity, minimum count `2`, adjacent gap `5s`, and maximum span `18s`; all four values are adjustable from the panel.
-- Density limits default to `12` same-moment emits and `5000` scheduled comments after similar merge; once comments are available, the two values are coupled by one-second local density buckets so dense seconds are capped and sparse seconds only count their actual comments.
+- Density limits default to `12` same-moment emits and `10000` scheduled comments after similar merge. Same-moment emits cap only dense one-second buckets while sparse periods keep all comments; max-load is independent and is not derived from episode duration or source count.
 - The optional `Merge first` density mode keeps merged counted comments ahead of unmerged comments when max-load or same-moment limits have to drop items.
 
 ## Project Structure

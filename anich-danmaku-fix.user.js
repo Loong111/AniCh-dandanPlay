@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.6.6
+// @version      2.6.8
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -29,6 +29,7 @@
   const PRIMARY_ROUTE_RE = /^\/b\/(\d+)\/(\d+)\/?$/;
   const STORAGE_PREFIX = "anichDanmaku:";
   const SETTINGS_KEY = `${STORAGE_PREFIX}settings`;
+  const SETTINGS_MIGRATION_KEY = `${STORAGE_PREFIX}settingsMigrationVersion`;
   const API_CONFIG_KEY = `${STORAGE_PREFIX}apiConfig`;
   const MATCH_CACHE_KEY = `${STORAGE_PREFIX}episodeMatchCache`;
   const PREFERENCE_CACHE_KEY = `${STORAGE_PREFIX}seriesPreferenceCache`;
@@ -72,7 +73,7 @@
     similarMergeGapSeconds: 5,
     similarMergeMaxSpanSeconds: 18,
     maxEmitPerFrame: 12,
-    maxScheduledComments: 5000,
+    maxScheduledComments: 10000,
     densityPreferMergedComments: false,
     blockedModes: DEFAULT_BLOCKED_MODES,
     blockedKeywords: [],
@@ -104,9 +105,9 @@
   const CONTEXT_WAIT_INTERVAL_MS = 50;
   const CONTEXT_WAIT_WINDOWS = 2;
   const IMPORT_POPOVER_CLOSE_DELAY_MS = 180;
-  const CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS = 0.2;
   const CONTROL_SETTING_DEBOUNCE_MS = 180;
   const DENSITY_BUCKET_SECONDS = 1;
+  const CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS = 0.2;
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
@@ -133,7 +134,7 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.6.6";
+  const USER_AGENT = "AniChDanmakuFix/2.6.8";
   const SKIP_CUE_KEYWORD = "空降";
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -589,20 +590,6 @@
     return normalizeDensityDurationSeconds(maxTime);
   }
 
-  function getDensityMaxEmitForDuration(durationSeconds) {
-    const duration = normalizeDensityDurationSeconds(durationSeconds);
-    if (!duration) {
-      return SETTING_LIMITS.maxEmitPerFrame.max;
-    }
-    return Math.round(
-      clamp(
-        Math.ceil(SETTING_LIMITS.maxScheduledComments.max / duration),
-        SETTING_LIMITS.maxEmitPerFrame.min,
-        SETTING_LIMITS.maxEmitPerFrame.max
-      )
-    );
-  }
-
   function getDensityBucketCounts(comments, bucketSeconds = DENSITY_BUCKET_SECONDS) {
     const list = Array.isArray(comments) ? comments : [];
     const buckets = new Map();
@@ -619,90 +606,11 @@
     };
   }
 
-  function getDensityScheduleCapacityForCounts(counts, maxEmitPerFrame) {
-    const emitLimit = Math.max(0, Math.round(maxEmitPerFrame));
-    return (Array.isArray(counts) ? counts : []).reduce(
-      (total, count) => total + Math.min(Math.max(0, Math.round(count)), emitLimit),
-      0
-    );
-  }
-
-  function getDensityFallbackScheduleCapacity(maxEmitPerFrame, durationSeconds) {
-    const duration = normalizeDensityDurationSeconds(durationSeconds);
-    if (!duration) {
-      return SETTING_LIMITS.maxScheduledComments.max;
-    }
-    return Math.round(
-      clamp(
-        Math.round(maxEmitPerFrame) * duration,
-        SETTING_LIMITS.maxScheduledComments.min,
-        SETTING_LIMITS.maxScheduledComments.max
-      )
-    );
-  }
-
-  function getDensityScheduleCapacity(comments, maxEmitPerFrame, durationSeconds) {
-    const bucketStats = getDensityBucketCounts(comments);
-    const rawCapacity = bucketStats.totalCount
-      ? getDensityScheduleCapacityForCounts(bucketStats.counts, maxEmitPerFrame)
-      : getDensityFallbackScheduleCapacity(maxEmitPerFrame, durationSeconds);
-    return Math.round(
-      clamp(
-        rawCapacity,
-        SETTING_LIMITS.maxScheduledComments.min,
-        SETTING_LIMITS.maxScheduledComments.max
-      )
-    );
-  }
-
-  function getDensityMaxEmitForTimeline(comments, durationSeconds) {
-    const bucketStats = getDensityBucketCounts(comments);
-    if (bucketStats.totalCount) {
-      return Math.round(
-        clamp(
-          bucketStats.peakCount || SETTING_LIMITS.maxEmitPerFrame.min,
-          SETTING_LIMITS.maxEmitPerFrame.min,
-          SETTING_LIMITS.maxEmitPerFrame.max
-        )
-      );
-    }
-    return getDensityMaxEmitForDuration(durationSeconds);
-  }
-
-  function getDensityEmitForScheduledCount(comments, targetCount, durationSeconds) {
-    const target = Math.round(
-      clamp(
-        safeNumber(targetCount, DEFAULT_SETTINGS.maxScheduledComments),
-        SETTING_LIMITS.maxScheduledComments.min,
-        SETTING_LIMITS.maxScheduledComments.max
-      )
-    );
-    const bucketStats = getDensityBucketCounts(comments);
-    const maxEmit = getDensityMaxEmitForTimeline(comments, durationSeconds);
-    if (!bucketStats.totalCount) {
-      const duration = normalizeDensityDurationSeconds(durationSeconds);
-      return Math.round(
-        clamp(
-          duration ? Math.ceil(target / duration) : DEFAULT_SETTINGS.maxEmitPerFrame,
-          SETTING_LIMITS.maxEmitPerFrame.min,
-          maxEmit
-        )
-      );
-    }
-    for (let emit = SETTING_LIMITS.maxEmitPerFrame.min; emit <= maxEmit; emit += 1) {
-      if (getDensityScheduleCapacityForCounts(bucketStats.counts, emit) >= target) {
-        return emit;
-      }
-    }
-    return maxEmit;
-  }
-
   function resolveDensityLimitSettings(settings, durationSeconds, changedKey = null, comments = []) {
     const next = normalizeSettings(settings || {});
     const duration = normalizeDensityDurationSeconds(durationSeconds);
-    const maxEmitForTimeline = getDensityMaxEmitForTimeline(comments, duration);
     next.maxEmitPerFrame = Math.round(
-      clamp(next.maxEmitPerFrame, SETTING_LIMITS.maxEmitPerFrame.min, maxEmitForTimeline)
+      clamp(next.maxEmitPerFrame, SETTING_LIMITS.maxEmitPerFrame.min, SETTING_LIMITS.maxEmitPerFrame.max)
     );
     next.maxScheduledComments = Math.round(
       clamp(
@@ -712,26 +620,18 @@
       )
     );
 
-    let scheduleCapacity = getDensityScheduleCapacity(comments, next.maxEmitPerFrame, duration);
-    if (changedKey === "maxScheduledComments" && next.maxScheduledComments > scheduleCapacity) {
-      next.maxEmitPerFrame = getDensityEmitForScheduledCount(comments, next.maxScheduledComments, duration);
-      scheduleCapacity = getDensityScheduleCapacity(comments, next.maxEmitPerFrame, duration);
-    }
-    next.maxScheduledComments = Math.round(
-      clamp(next.maxScheduledComments, SETTING_LIMITS.maxScheduledComments.min, scheduleCapacity)
-    );
-
     return {
       settings: next,
       durationSeconds: duration,
+      densityBuckets: getDensityBucketCounts(comments),
       bounds: {
         maxEmitPerFrame: {
           min: SETTING_LIMITS.maxEmitPerFrame.min,
-          max: maxEmitForTimeline,
+          max: SETTING_LIMITS.maxEmitPerFrame.max,
         },
         maxScheduledComments: {
           min: SETTING_LIMITS.maxScheduledComments.min,
-          max: scheduleCapacity,
+          max: SETTING_LIMITS.maxScheduledComments.max,
         },
       },
     };
@@ -744,6 +644,7 @@
       maxScheduledComments: resolved.settings.maxScheduledComments,
       preferMergedComments: !!resolved.settings.densityPreferMergedComments,
       durationSeconds: resolved.durationSeconds,
+      densityBuckets: resolved.densityBuckets,
       bounds: resolved.bounds,
       bucketSeconds: DENSITY_BUCKET_SECONDS,
     };
@@ -875,6 +776,8 @@
       preferMergedComments: !!config.preferMergedComments,
       durationSeconds: config.durationSeconds,
       bucketSeconds: config.bucketSeconds,
+      bucketPeakCount: safeNumber(config.densityBuckets?.peakCount, 0),
+      bucketActiveCount: Array.isArray(config.densityBuckets?.counts) ? config.densityBuckets.counts.length : 0,
       bounds: config.bounds,
       inputCount,
       outputCount,
@@ -1048,6 +951,18 @@
       return JSON.parse(raw) === true;
     } catch {
       return !!fallback;
+    }
+  }
+
+  function storageGetNumber(key, fallback = 0) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw == null) {
+        return fallback;
+      }
+      return safeNumber(JSON.parse(raw), fallback);
+    } catch {
+      return fallback;
     }
   }
 
@@ -1807,7 +1722,16 @@
       return "无";
     }
     return entries
-      .map(([sourceKey, entry]) => `${entry?.label || sourceKey}: ${safeNumber(entry?.count, 0)} 条`)
+      .map(([sourceKey, entry]) => {
+        const count = safeNumber(entry?.count, 0);
+        const acceptedCount = safeNumber(entry?.acceptedCount, count);
+        const dedupedCount = safeNumber(entry?.dedupedCount, Math.max(0, count - acceptedCount));
+        const label = entry?.label || sourceKey;
+        if (dedupedCount > 0 || acceptedCount !== count) {
+          return `${label}: 原始 ${count} 条（并入 ${acceptedCount} / 去重 ${dedupedCount}）`;
+        }
+        return `${label}: ${count} 条`;
+      })
       .join(" + ");
   }
 
@@ -1822,56 +1746,62 @@
   }
 
   function getDanmakuFuzzyKey(comment) {
+    const text = normalizeSpace(comment?.text || "");
+    if (!text) {
+      return "";
+    }
     return [
-      normalizeSpace(comment?.text || ""),
+      text,
       MODE_MAP[comment?.mode] || comment?.mode || "rtl",
     ].join("|");
   }
 
   function getDanmakuTimeBucket(time, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
-    const safeWindow = Math.max(0.01, safeNumber(windowSeconds, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS));
-    return Math.round(safeNumber(time, 0) / safeWindow);
+    const windowSize = Math.max(0.001, safeNumber(windowSeconds, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS));
+    return Math.round(Math.max(0, safeNumber(time, 0)) / windowSize);
   }
 
   function hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
-    const fuzzyKey = getDanmakuFuzzyKey(comment);
-    if (!fuzzyKey) {
+    if (!priorFuzzyIndex || !priorFuzzyIndex.size) {
       return false;
     }
-    const bucketMap = priorFuzzyIndex.get(fuzzyKey);
+    const key = getDanmakuFuzzyKey(comment);
+    if (!key) {
+      return false;
+    }
+    const bucketMap = priorFuzzyIndex.get(key);
     if (!bucketMap) {
       return false;
     }
-    const commentTime = safeNumber(comment?.time, 0);
-    const centerBucket = getDanmakuTimeBucket(commentTime, windowSeconds);
-    for (let bucket = centerBucket - 1; bucket <= centerBucket + 1; bucket += 1) {
-      const candidates = bucketMap.get(bucket);
-      if (!Array.isArray(candidates) || !candidates.length) {
+    const time = safeNumber(comment?.time, 0);
+    const bucket = getDanmakuTimeBucket(time, windowSeconds);
+    for (let offset = -1; offset <= 1; offset += 1) {
+      const candidates = bucketMap.get(bucket + offset);
+      if (!candidates) {
         continue;
       }
-      for (const candidateTime of candidates) {
-        if (Math.abs(candidateTime - commentTime) <= windowSeconds) {
-          return true;
-        }
+      if (candidates.some((candidateTime) => Math.abs(candidateTime - time) <= windowSeconds)) {
+        return true;
       }
     }
     return false;
   }
 
   function indexCrossSourceFuzzyComment(comment, priorFuzzyIndex, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
-    const fuzzyKey = getDanmakuFuzzyKey(comment);
-    if (!fuzzyKey) {
+    const key = getDanmakuFuzzyKey(comment);
+    if (!key) {
       return;
     }
-    const centerBucket = getDanmakuTimeBucket(comment?.time, windowSeconds);
-    let bucketMap = priorFuzzyIndex.get(fuzzyKey);
-    if (!bucketMap) {
-      bucketMap = new Map();
-      priorFuzzyIndex.set(fuzzyKey, bucketMap);
+    const time = safeNumber(comment?.time, 0);
+    const bucket = getDanmakuTimeBucket(time, windowSeconds);
+    if (!priorFuzzyIndex.has(key)) {
+      priorFuzzyIndex.set(key, new Map());
     }
-    const candidates = bucketMap.get(centerBucket) || [];
-    candidates.push(safeNumber(comment?.time, 0));
-    bucketMap.set(centerBucket, candidates);
+    const bucketMap = priorFuzzyIndex.get(key);
+    if (!bucketMap.has(bucket)) {
+      bucketMap.set(bucket, []);
+    }
+    bucketMap.get(bucket).push(time);
   }
 
   function readProtoVarint(bytes, offset) {
@@ -3946,13 +3876,13 @@
 
     rebuild() {
       const ids = new Set();
+      const priorFuzzyIndex = new Map();
       const merged = [];
       const sourceBreakdown = {};
-      const priorFuzzyIndex = new Map();
       let sourceLabels = [];
       let episodeId = null;
-
       let sourceIndex = 0;
+
       for (const [sourceKey, bucket] of this.sources.entries()) {
         const bucketComments = Array.isArray(bucket?.comments)
           ? bucket.comments
@@ -3983,16 +3913,21 @@
           if (ids.has(uniqueId)) {
             continue;
           }
-          if (sourceIndex > 0 && hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex)) {
+          if (
+            sourceIndex > 0 &&
+            hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS)
+          ) {
             continue;
           }
           ids.add(uniqueId);
           merged.push(comment);
           acceptedComments.push(comment);
         }
-        for (const comment of acceptedComments) {
-          indexCrossSourceFuzzyComment(comment, priorFuzzyIndex);
-        }
+        acceptedComments.forEach((comment) => {
+          indexCrossSourceFuzzyComment(comment, priorFuzzyIndex, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS);
+        });
+        sourceBreakdown[sourceKey].acceptedCount = acceptedComments.length;
+        sourceBreakdown[sourceKey].dedupedCount = Math.max(0, bucketComments.length - acceptedComments.length);
         sourceIndex += 1;
       }
       merged.sort((left, right) => left.time - right.time);
@@ -5672,7 +5607,7 @@
       priorityRow.append(priorityLabel, prioritySwitch, priorityValue);
       card.appendChild(priorityRow);
 
-      card.appendChild(createElement("div", "anich-ddm-card-note", "同刻发送和最大加载会按当前视频时长互相约束。数字框可直接输入；开启合并优先后，密度裁剪会先保留合并计数弹幕，单条弹幕在超额时更早被丢弃。"));
+      card.appendChild(createElement("div", "anich-ddm-card-note", "同刻发送只负责按 1 秒局部密度削峰，稀疏时间段保留全部弹幕；最大加载是独立的全局兜底上限。数字框可直接输入；开启合并优先后，密度裁剪会先保留合并计数弹幕，单条弹幕在超额时更早被丢弃。"));
       return card;
     }
 
@@ -6338,12 +6273,14 @@
 
       const context = session.resolvePageContext();
       const transportConfig = session.transport.getConfig();
-      const densityDurationText = densityState.durationSeconds ? ` | 时长 ${formatClockTime(densityState.durationSeconds)}` : "";
+      const densityPeakText = session.densityLimitStats?.bucketPeakCount
+        ? ` | 1秒峰值 ${Math.round(session.densityLimitStats.bucketPeakCount)}`
+        : "";
       const summaryLines = [
         `已加载: ${session.store.stats.count} | 可见: ${session.store.stats.visibleCount} | 已屏蔽: ${session.store.stats.filteredCount}`,
         `来源桶: ${summarizeSourceBreakdown(session.store.stats.sourceBreakdown)}`,
         `相似合并: ${settings.similarMergeEnabled ? "开" : "关"} | 输出 ${safeNumber(session.similarMergeStats?.outputCount, 0)} / 输入 ${safeNumber(session.similarMergeStats?.inputCount, 0)} | 合并组 ${safeNumber(session.similarMergeStats?.groups, 0)} | 折叠 ${safeNumber(session.similarMergeStats?.collapsedCount, 0)} 条`,
-        `密度限制: 调度 ${safeNumber(session.densityLimitStats?.outputCount, 0)} / ${safeNumber(session.densityLimitStats?.inputCount, 0)} | 裁剪 ${safeNumber(session.densityLimitStats?.droppedCount, 0)} | 同刻 ${Math.round(settings.maxEmitPerFrame)} 条${densityDurationText} | 合并优先 ${settings.densityPreferMergedComments ? "开" : "关"}`,
+        `密度限制: 调度 ${safeNumber(session.densityLimitStats?.outputCount, 0)} / ${safeNumber(session.densityLimitStats?.inputCount, 0)} | 裁剪 ${safeNumber(session.densityLimitStats?.droppedCount, 0)} | 同刻 ${Math.round(settings.maxEmitPerFrame)} 条 | 最大 ${Math.round(settings.maxScheduledComments)} 条${densityPeakText} | 合并优先 ${settings.densityPreferMergedComments ? "开" : "关"}`,
         `显示区域: ${Math.round(settings.displayRegionRatio * 100)}% (仅滚动弹幕)`,
         `已启用类型: ${MODE_KEYS.filter((mode) => !settings.blockedModes[mode]).map((mode) => MODE_LABELS[mode]).join(" / ") || "无"}`,
         `关键词规则: ${settings.blockedKeywords.length} 条`,
@@ -6374,7 +6311,9 @@
       this.route = route;
       this.token = app.nextToken();
       this.destroyed = false;
-      this.settings = normalizeSettings(storageGet(SETTINGS_KEY, DEFAULT_SETTINGS));
+      const storedSettings = storageGet(SETTINGS_KEY, DEFAULT_SETTINGS);
+      this.settings = normalizeSettings(storedSettings);
+      this.applySettingsMigrations(storedSettings);
       if (!storageGetBoolean(SIMILAR_MERGE_OPT_IN_KEY, false)) {
         this.settings.similarMergeEnabled = false;
       }
@@ -6401,6 +6340,17 @@
       this.densityCandidateComments = [];
       this.bilibiliImport = this.getPendingBilibiliImportState();
       this.handleVideoDurationChange = this.handleVideoDurationChange.bind(this);
+    }
+
+    applySettingsMigrations(storedSettings) {
+      const migrationVersion = storageGetNumber(SETTINGS_MIGRATION_KEY, 0);
+      if (migrationVersion < 267 && safeNumber(storedSettings?.maxScheduledComments, 0) === 5000) {
+        this.settings.maxScheduledComments = DEFAULT_SETTINGS.maxScheduledComments;
+      }
+      if (migrationVersion < 267) {
+        storageSet(SETTINGS_MIGRATION_KEY, 267);
+        storageSet(SETTINGS_KEY, this.settings);
+      }
     }
 
     makeAbortController() {
