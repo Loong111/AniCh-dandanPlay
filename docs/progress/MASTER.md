@@ -40,12 +40,13 @@
 **Blockers**: Live AniCh/userscript-manager verification remains user-owned; Phase 6 live multi-import verification is still pending
 
 ## Next Steps
-1. Verify v2.6.9 SkipCue on live AniCh playback: the prompt should appear and click-to-seek should work in normal view and browser fullscreen, including when `偏移` is non-zero.
-2. Verify v2.6.9 on the high-danmaku episode and confirm `最大加载` defaults to `10000` and no longer changes when `同刻发送` changes.
-3. Confirm `同刻发送` only shaves dense one-second buckets while sparse segments keep all comments.
-4. Confirm Bilibili imports use cross-source `0.2s` fuzzy dedupe for overlapping sources, and compare source bucket raw/accepted/deduped counts with `已加载` and merge input counts.
-5. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
-6. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
+1. Verify v2.7.0 control UI on live AniCh playback: the Apple-inspired frosted toolbar, settings panel, Bilibili import popover, matcher, switches, sliders, and skip prompt should remain readable, clickable, draggable, and responsive outside browser fullscreen.
+2. Verify v2.6.9 SkipCue on live AniCh playback: the prompt should appear and click-to-seek should work in normal view and browser fullscreen, including when `偏移` is non-zero.
+3. Verify v2.6.9 on the high-danmaku episode and confirm `最大加载` defaults to `10000` and no longer changes when `同刻发送` changes.
+4. Confirm `同刻发送` only shaves dense one-second buckets while sparse segments keep all comments.
+5. Confirm Bilibili imports use cross-source `0.2s` fuzzy dedupe for overlapping sources, and compare source bucket raw/accepted/deduped counts with `已加载` and merge input counts.
+6. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
+7. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
 
 ## Session Log
 | Date | Session | Summary |
@@ -77,3 +78,4 @@
 | 2026-05-02 | 25 | Added v2.6.7 max-load decoupling, 10000 default max-load, local peak-only same-moment limiting, and removed cross-source fuzzy dedupe that suppressed imported Bilibili comments |
 | 2026-05-02 | 26 | Added v2.6.8 cross-source 0.2s fuzzy dedupe restoration, preserved raw one-second peak summary stats, and made source bucket raw/accepted/deduped counts visible |
 | 2026-05-02 | 27 | Added v2.6.9 SkipCue hotfix: restored fullscreen skip prompt visibility, made click-to-seek offset-aware, refreshed the scheduler after jumps, and validated syntax, diff whitespace, plus a local SkipCue/CSS probe |
+| 2026-05-02 | 28 | Added v2.7.0 Apple-inspired control UI refresh with frosted external toolbar, 44px circular action buttons, light settings/import/matcher panels, refined switch/range controls, press-scale micro-interactions, responsive layout rules, and local static/CSS validation |

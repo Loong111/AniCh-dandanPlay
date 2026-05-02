@@ -37,6 +37,7 @@
 - Density and import-source correction: v2.6.7 decouples max scheduled comments from same-moment emits, changes the default max scheduled comments to 10000, keeps same-moment emits as one-second local peak shaving, and briefly removed cross-source fuzzy dedupe while investigating source-bucket accounting.
 - Cross-source dedupe correction: v2.6.8 restores the 0.2s same-text/type fuzzy duplicate window for later source buckets, keeps the raw one-second peak statistic visible in the runtime summary, and expands source-bucket summaries with raw, accepted, and deduped counts.
 - SkipCue hotfix: v2.6.9 restores the skip prompt in browser fullscreen by removing it from the fullscreen-hidden UI group, makes prompt click seek to `targetTime - offset`, and immediately refreshes the scheduler after the seek. Static validation plus a local SkipCue/CSS probe passed; live fullscreen click verification remains user-owned.
+- Control UI refresh: v2.7.0 adds an Apple-inspired visual layer for the external toolbar, settings panel, Bilibili import popover, matcher, switches, sliders, and skip prompt using a single #0066cc action color, frosted light surfaces, 44px circular toolbar buttons, pill/18px radius grammar, press-scale micro-interactions, and responsive control layouts. Static validation, diff whitespace validation, and a local CSS structure probe passed; live AniCh visual verification remains user-owned.
 
 ## Phase Completion Checklist
 - [x] Task 7.1 complete with S.U.P.E.R boundaries preserved
