@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.7.0
+// @version      2.7.1
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -134,7 +134,7 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.6.9";
+  const USER_AGENT = "AniChDanmakuFix/2.7.1";
   const SKIP_CUE_KEYWORD = "空降";
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -986,6 +986,12 @@
     return match ? readPositiveInt(match[1]) : null;
   }
 
+  function extractBilibiliPgcSeasonId(value) {
+    const text = String(value || "");
+    const match = text.match(/(?:bangumi\/play\/)?ss(\d+)/i) || text.match(/[?&]season_id=(\d+)/i);
+    return match ? readPositiveInt(match[1]) : null;
+  }
+
   function getBilibiliImportSourceType(value) {
     return value === "pgc" ? "pgc" : "video";
   }
@@ -1032,6 +1038,19 @@
           pgcEpisodeExplicit: true,
         };
       }
+      const pgcSeasonId = extractBilibiliPgcSeasonId(input);
+      if (pgcSeasonId) {
+        return {
+          rawInput: input,
+          resolvedUrl: buildBilibiliPgcSeasonUrl(pgcSeasonId),
+          sourceType: "pgc",
+          bvid: "",
+          pgcSeasonId,
+          page: 1,
+          pageExplicit: false,
+          pgcSeasonExplicit: true,
+        };
+      }
       const syntheticPgc = parseBilibiliSyntheticPgcInput(input);
       if (syntheticPgc?.pgcSeasonId && syntheticPgc?.pgcEpisodeNumber) {
         return {
@@ -1046,7 +1065,7 @@
           pgcEpisodeExplicit: true,
         };
       }
-      throw new Error("仅支持 BV 号、B 站视频链接、番剧 ep 链接或 b23 短链");
+      throw new Error("仅支持 BV 号、B 站视频链接、番剧 ep/ss 链接或 b23 短链");
     }
 
     let url = null;
@@ -1077,6 +1096,19 @@
           pgcEpisodeExplicit: true,
         };
       }
+      const pgcSeasonId = extractBilibiliPgcSeasonId(input);
+      if (pgcSeasonId) {
+        return {
+          rawInput: input,
+          resolvedUrl: buildBilibiliPgcSeasonUrl(pgcSeasonId),
+          sourceType: "pgc",
+          bvid: "",
+          pgcSeasonId,
+          page: 1,
+          pageExplicit: false,
+          pgcSeasonExplicit: true,
+        };
+      }
       const syntheticPgc = parseBilibiliSyntheticPgcInput(input);
       if (syntheticPgc?.pgcSeasonId && syntheticPgc?.pgcEpisodeNumber) {
         return {
@@ -1099,6 +1131,7 @@
     const page = readPositiveInt(pageParam) || 1;
     const pageExplicit = pageParam != null && pageParam !== "";
     const pgcEpId = extractBilibiliPgcEpId(url.toString());
+    const pgcSeasonId = extractBilibiliPgcSeasonId(url.toString());
     if (host === "b23.tv" || host === "www.b23.tv") {
       return {
         rawInput: input,
@@ -1124,9 +1157,22 @@
       };
     }
 
+    if (pgcSeasonId) {
+      return {
+        rawInput: input,
+        resolvedUrl: buildBilibiliPgcSeasonUrl(pgcSeasonId),
+        sourceType: "pgc",
+        bvid: "",
+        pgcSeasonId,
+        page: 1,
+        pageExplicit: false,
+        pgcSeasonExplicit: true,
+      };
+    }
+
     const bvid = extractBilibiliBvid(url.toString());
     if (!bvid) {
-      throw new Error("仅支持 BV 视频链接、番剧 ep 链接，不支持 av 号或其他页面");
+      throw new Error("仅支持 BV 视频链接、番剧 ep/ss 链接，不支持 av 号或其他页面");
     }
     return {
       rawInput: input,
@@ -1155,6 +1201,11 @@
     return normalizedEpId ? `https://www.bilibili.com/bangumi/play/ep${normalizedEpId}` : "";
   }
 
+  function buildBilibiliPgcSeasonUrl(pgcSeasonId) {
+    const normalizedSeasonId = readPositiveInt(pgcSeasonId);
+    return normalizedSeasonId ? `https://www.bilibili.com/bangumi/play/ss${normalizedSeasonId}` : "";
+  }
+
   function readBilibiliPgcEpisodeNumber(episode) {
     return (
       readPositiveInt(episode?.title) ||
@@ -1178,6 +1229,7 @@
         pgcSeasonId: parsed.pgcSeasonId,
         pgcEpisodeNumber: parsed.pgcEpisodeNumber,
         page: parsed.page,
+        pgcSeasonExplicit: !!parsed.pgcSeasonExplicit,
       });
     } catch {
       return normalizeBilibiliImportRecord({
@@ -4306,10 +4358,13 @@
     buildHeaders(target, accept = "*/*") {
       const bvid = extractBilibiliBvid(target || "");
       const pgcEpId = extractBilibiliPgcEpId(target || "") || readPositiveInt(target);
+      const pgcSeasonId = extractBilibiliPgcSeasonId(target || "");
       const referer = bvid
         ? `https://www.bilibili.com/video/${bvid}/`
         : pgcEpId
         ? buildBilibiliPgcEpisodeUrl(pgcEpId)
+        : pgcSeasonId
+        ? buildBilibiliPgcSeasonUrl(pgcSeasonId)
         : "https://www.bilibili.com/";
       return {
         Accept: accept,
@@ -4372,7 +4427,7 @@
         typeof target === "object" ? target?.pgcEpisodeNumber || target?.episodeNumber : null
       );
       if (!normalizedEpId && (!targetSeasonId || !targetEpisodeNumber)) {
-        throw new Error("缺少有效的 B 站番剧 ep 号或 season/集号");
+        throw new Error("缺少有效的 B 站番剧 ep 号，或 season_id + 集号");
       }
       const url = normalizedEpId
         ? `${BILIBILI_API}/pgc/view/web/season?ep_id=${encodeURIComponent(normalizedEpId)}`
@@ -4380,7 +4435,10 @@
       const response = await requestWithUserscript(
         {
           url,
-          headers: this.buildHeaders(normalizedEpId ? `ep${normalizedEpId}` : "", "application/json"),
+          headers: this.buildHeaders(
+            normalizedEpId ? `ep${normalizedEpId}` : targetSeasonId ? `ss${targetSeasonId}` : "",
+            "application/json"
+          ),
         },
         session
       );
@@ -4415,7 +4473,8 @@
       const cid = safeNumber(episode.cid, 0);
       const aid = safeNumber(episode.aid, 0);
       if (!resolvedBvid || !cid || !aid) {
-        throw new Error(`ep${normalizedEpId} 缺少可用的 B 站弹幕参数`);
+        const targetLabel = normalizedEpId ? `ep${normalizedEpId}` : `season ${targetSeasonId} 第${targetEpisodeNumber}集`;
+        throw new Error(`${targetLabel} 缺少可用的 B 站弹幕参数`);
       }
       const durationRaw = safeNumber(episode.duration, 0);
       const durationSeconds = durationRaw > 10000 ? durationRaw / 1000 : durationRaw;
@@ -6033,7 +6092,7 @@
 
       const actions = createElement("div", "anich-ddm-import-actions");
       this.importInput = createElement("input", "anich-ddm-input");
-      this.importInput.placeholder = "输入 BV、视频链接或 https://www.bilibili.com/bangumi/play/ep...";
+      this.importInput.placeholder = "输入 BV、视频链接或 https://www.bilibili.com/bangumi/play/ep... / ss...";
       this.importInput.addEventListener("keydown", async (event) => {
         if (event.key !== "Enter") {
           return;
@@ -7942,6 +8001,7 @@
         page: resolved.page,
         pageExplicit: !!resolved.pageExplicit,
         pgcEpisodeExplicit: !!resolved.pgcEpisodeExplicit,
+        pgcSeasonExplicit: !!resolved.pgcSeasonExplicit,
       };
     }
 
@@ -8004,9 +8064,21 @@
         this.setStatus(modeMessage, modeLabel);
       }
 
-      const target = await this.resolveBilibiliImportInput(record?.rawInput || "");
+      let target = await this.resolveBilibiliImportInput(record?.rawInput || "");
       if (!this.isFresh(token)) {
         return false;
+      }
+      const context = this.resolvePageContext();
+      if (target.sourceType === "pgc" && target.pgcSeasonId && !target.pgcEpId && !target.pgcEpisodeNumber) {
+        const currentEpisodeNumber = readPositiveInt(context?.parsedEpisode || context?.episode);
+        if (!currentEpisodeNumber) {
+          throw new Error("ss 链接需要先从当前 AniCh 页面识别集数");
+        }
+        target = Object.assign({}, target, {
+          pgcEpisodeNumber: currentEpisodeNumber,
+          pgcSeasonExplicit: true,
+          pgcEpisodeExplicit: false,
+        });
       }
       const videoMeta =
         target.sourceType === "pgc"
@@ -8033,7 +8105,6 @@
       if (!this.isFresh(token)) {
         return false;
       }
-      const context = this.resolvePageContext();
       const nextSeriesRule = mode === "manual" ? this.buildBilibiliSeriesRuleFromTarget(target, context, {
         sourceType: videoMeta.sourceType,
         bvid: videoMeta.bvid,

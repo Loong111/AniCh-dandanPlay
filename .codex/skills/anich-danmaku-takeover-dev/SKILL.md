@@ -103,7 +103,7 @@ Before marking any task as complete, verify ALL of the following:
 
 ### Required Layering
 - `DandanplayTransport` owns episode search, bangumi fetch, comment fetch, and API fallback.
-- `BilibiliTransport` owns BV parsing follow-up requests, PGC bangumi `ep` metadata resolution, short-link resolution, `cid` lookup, and segmented protobuf danmaku fetch/normalization.
+- `BilibiliTransport` owns BV parsing follow-up requests, PGC bangumi `ep`/`ss` metadata resolution, short-link resolution, `cid` lookup, and segmented protobuf danmaku fetch/normalization.
 - `DanmakuStore` owns source buckets, dedupe, sorting, and stats.
 - `Scheduler` owns time-window selection.
 - `Renderer` owns overlay and animation.
@@ -118,7 +118,8 @@ Before marking any task as complete, verify ALL of the following:
 - Preserve one source bucket per imported Bilibili binding using stable keys such as `import:bilibili:<bindingKey>`; refreshing the same binding updates that bucket in place, while different bindings may coexist and merge.
 - Preserve cross-source duplicate suppression before filtering and merging: exact fingerprints always dedupe, and later source buckets use a same-text/type `0.2s` fuzzy duplicate window against earlier accepted source comments.
 - Preserve route-scoped Bilibili import collections and season-scoped chain collections separately; restore precedence applies per chain as `explicit route binding > derived route binding > live chain derivation`, and all matching chains merge on the target AniCh episode unless the user explicitly asks for a priority model.
-- Bilibili PGC bangumi `ep` links must resolve through `pgc/view/web/season` and derive by `season_id + episode number offset`, not raw `ep_id + n`, because official Bilibili `ep_id` values may stop being consecutive mid-season.
+- Bilibili PGC bangumi `ep`/`ss` links must resolve through `pgc/view/web/season` and derive by `season_id + episode number offset`, not raw `ep_id + n`, because official Bilibili `ep_id` values may stop being consecutive mid-season.
+- Bilibili PGC bangumi `ss` links do not carry a concrete episode id; manual imports must use the current AniCh episode number as the Bilibili season episode number before resolving metadata.
 - Per-link clear removes only the selected binding plus that chain's derived route entries; a route-level clear-all may remove every active Bilibili binding on the current AniCh route without touching unrelated explicit imports on other routes.
 - If a derived chain currently points at a missing `p`, skip that chain for the current visit but keep the chain cached so later AniCh visits can auto-restore once the Bilibili side has that page.
 - Keep `SkipCue` derived from normalized comments as a separate side-channel; do not fold click behavior into `Renderer`.

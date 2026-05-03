@@ -15,7 +15,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - Independent danmaku pipeline for AniCh episode pages.
 - Dandanplay-based comment loading with built-in proxy fallback and custom API prefix support.
 - Automatic title and episode matching, plus manual search and manual match when auto-match is wrong.
-- Bilibili danmaku import for BV/video links, `b23` short links, and official bangumi `ep` links, with multi-link merge and season-chain restore.
+- Bilibili danmaku import for BV/video links, `b23` short links, and official bangumi `ep`/`ss` links, with multi-link merge and season-chain restore.
 - External toolbar placed outside the player so the video area stays unobstructed.
 - Adjustable font size, display region, opacity, speed, and time offset.
 - Filter controls for danmaku mode, keywords, and regular expressions.
@@ -43,7 +43,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 3. Click the settings button to open the control panel.
 4. Adjust basic options such as font size, display region, opacity, speed, and offset.
 5. If auto-match fails, open `Match / Source`, run a manual search, choose an episode, and confirm the match.
-6. Hover the toolbar settings button to import Bilibili danmaku from a BV/video link, `b23` link, or bangumi `ep` link.
+6. Hover the toolbar settings button to import Bilibili danmaku from a BV/video link, `b23` link, or bangumi `ep`/`ss` link.
 7. Use keyword or regex filters when you want to hide specific comments, or adjust similar-comment merge from the `Filters` tab when dense repeated comments should be collapsed.
 
 ## Configuration Notes
@@ -51,7 +51,7 @@ This project provides a Dandanplay-based danmaku experience for AniCh. It packag
 - The script stores settings, API configuration, match cache, preference cache, and toolbar position in browser `localStorage`.
 - A custom API prefix can be configured from the panel if you want to route requests through your own Dandanplay-compatible endpoint.
 - Built-in proxy candidates are used automatically when direct access is unavailable.
-- Bilibili import bindings are stored per AniCh route, while BV `?p=` and bangumi `ep` inputs can seed season-level restore chains.
+- Bilibili import bindings are stored per AniCh route, while BV `?p=` and bangumi `ep`/`ss` inputs can seed season-level restore chains.
 - Bilibili imports are deduped against earlier sources by exact fingerprint, plus a cross-source fuzzy check for same text/type comments within `0.2s`; the runtime source summary reports raw, accepted, and deduped counts when drops happen.
 - Similar-comment merge can be manually enabled from the panel with `80%` default similarity, minimum count `2`, adjacent gap `5s`, and maximum span `18s`; all four values are adjustable from the panel.
 - Density limits default to `12` same-moment emits and `10000` scheduled comments after similar merge. Same-moment emits cap only dense one-second buckets while sparse periods keep all comments; max-load is independent and is not derived from episode duration or source count.

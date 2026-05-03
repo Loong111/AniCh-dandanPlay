@@ -2,7 +2,7 @@
 
 > **Task**: Deliver and maintain an AniCh-specific Dandanplay danmaku userscript.
 > **Started**: 2026-04-19
-> **Last Updated**: 2026-05-02
+> **Last Updated**: 2026-05-03
 
 ## References
 - [Project Overview](../analysis/project-overview.md)
@@ -46,7 +46,7 @@
 4. Confirm `同刻发送` only shaves dense one-second buckets while sparse segments keep all comments.
 5. Confirm Bilibili imports use cross-source `0.2s` fuzzy dedupe for overlapping sources, and compare source bucket raw/accepted/deduped counts with `已加载` and merge input counts.
 6. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
-7. Re-run Phase 6 multi-import live checks when needed, because that manual verification remains pending.
+7. Re-run Phase 6 multi-import live checks when needed, including Bilibili bangumi `ss` links such as `https://www.bilibili.com/bangumi/play/ss4145`, because that manual verification remains pending.
 
 ## Session Log
 | Date | Session | Summary |
@@ -79,3 +79,4 @@
 | 2026-05-02 | 26 | Added v2.6.8 cross-source 0.2s fuzzy dedupe restoration, preserved raw one-second peak summary stats, and made source bucket raw/accepted/deduped counts visible |
 | 2026-05-02 | 27 | Added v2.6.9 SkipCue hotfix: restored fullscreen skip prompt visibility, made click-to-seek offset-aware, refreshed the scheduler after jumps, and validated syntax, diff whitespace, plus a local SkipCue/CSS probe |
 | 2026-05-02 | 28 | Added v2.7.0 Apple-inspired control UI refresh with frosted external toolbar, 44px circular action buttons, light settings/import/matcher panels, refined switch/range controls, press-scale micro-interactions, responsive layout rules, and local static/CSS validation |
+| 2026-05-03 | 29 | Added v2.7.1 Bilibili bangumi `ss` import support: `ss` season links parse to `season_id`, use the current AniCh episode number as the PGC episode number, reuse existing PGC season metadata and chain derivation, update docs, and keep live AniCh verification user-owned |
