@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.7.11
+// @version      2.7.12
 // @description  AniCh 专用弹弹 Play 弹幕 userscript，提供页面内控制栏、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
@@ -138,7 +138,7 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.7.11";
+  const USER_AGENT = "AniChDanmakuFix/2.7.12";
   const SKIP_CUE_KEYWORDS = Object.freeze(["空降", "跳伞", "指路", "传送", "跳转"]);
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
@@ -5011,11 +5011,17 @@
       return this.sources.has(sourceKey);
     }
 
-    replaceSource(sourceKey, comments, meta) {
-      this.sources.set(sourceKey, {
+    replaceSource(sourceKey, comments, meta, options = {}) {
+      const bucket = {
         comments: Array.isArray(comments) ? comments.slice() : [],
         meta: Object.assign({}, meta),
-      });
+      };
+      if (options.prepend) {
+        this.sources.delete(sourceKey);
+        this.sources = new Map([[sourceKey, bucket], ...this.sources.entries()]);
+      } else {
+        this.sources.set(sourceKey, bucket);
+      }
       this.rebuild();
     }
 
@@ -9255,6 +9261,26 @@
       return false;
     }
 
+    async handleAutoMatchFailure(token) {
+      this.currentMatch = null;
+      this.store.removeSource(DANDANPLAY_SOURCE_KEY);
+      const restored = await this.restoreBilibiliImportIfNeeded(token);
+      if (!this.isFresh(token)) {
+        return true;
+      }
+      if (restored || this.store.stats.count) {
+        this.setStatus(
+          `弹弹 Play 自动匹配失败，已使用 B 站弹幕 ${this.store.stats.count} 条`,
+          "B站弹幕"
+        );
+        return true;
+      }
+      this.scheduler.setComments([]);
+      this.renderer.clear();
+      this.setStatus("自动匹配失败，可手动匹配或导入 B 站弹幕。", "待匹配");
+      return false;
+    }
+
     isFresh(token) {
       return !this.destroyed && this.token === token;
     }
@@ -9295,11 +9321,7 @@
         const autoMatch = await this.runAutoMatch(token);
         if (!autoMatch || !this.isFresh(token)) {
           if (this.isFresh(token)) {
-            this.currentMatch = null;
-            this.store.clearAll();
-            this.scheduler.setComments([]);
-            this.renderer.clear();
-            this.setStatus("自动匹配失败，请手动搜索并确认。", "待匹配");
+            await this.handleAutoMatchFailure(token);
           }
           return;
         }
@@ -9541,11 +9563,18 @@
       }
       this.lastEndpoint = response.endpoint;
       const comments = this.normalizeComments(response.data, match, response.endpoint.sourceName || match.sourceName);
-      this.store.replaceSource(DANDANPLAY_SOURCE_KEY, comments, {
-        label: response.endpoint.sourceName || match.sourceName || "弹弹 Play",
-        source: response.endpoint.sourceName || match.sourceName || "dandanplay",
-        episodeId: match.episodeId,
-      });
+      this.store.replaceSource(
+        DANDANPLAY_SOURCE_KEY,
+        comments,
+        {
+          label: response.endpoint.sourceName || match.sourceName || "弹弹 Play",
+          source: response.endpoint.sourceName || match.sourceName || "dandanplay",
+          episodeId: match.episodeId,
+        },
+        {
+          prepend: true,
+        }
+      );
       this.refreshVisibleComments();
       const restored = await this.restoreBilibiliImportIfNeeded(token);
       if (!restored && this.isFresh(token)) {

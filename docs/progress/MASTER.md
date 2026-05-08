@@ -2,7 +2,7 @@
 
 > **Task**: Deliver and maintain an AniCh-specific Dandanplay danmaku userscript.
 > **Started**: 2026-04-19
-> **Last Updated**: 2026-05-04
+> **Last Updated**: 2026-05-09
 
 ## References
 - [Project Overview](../analysis/project-overview.md)
@@ -87,3 +87,4 @@
 | 2026-05-04 | 37 | Added v2.7.10 import-popover direction refinement: the page-integrated Bilibili import popover now opens upward from the control dock with a bottom-right transform origin while preserving the existing hover lifecycle and import UI behavior |
 | 2026-05-04 | 38 | Added v2.7.11 import-popover stacking fix: the page-integrated control dock now sits above the custom danmaku overlay stacking level so the upward Bilibili import popover is not visually covered by active danmaku |
 | 2026-05-04 | 39 | User completed live macOS Chrome performance verification: page CPU is about 15 with no script, about 20 with the script loaded, and window/fullscreen switching spikes to about 50 for roughly 5 seconds before returning to about 20; the no-loss performance optimization track is considered complete and cached video lookup remains unnecessary unless requested later |
+| 2026-05-09 | 40 | Added v2.7.12 Bilibili import fallback: manual imports and cached Bilibili restores can load without a matched Dandanplay base episode, and automatic Dandanplay match failure no longer clears Bilibili-only sources before stopping at the pending-match state |
