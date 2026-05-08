@@ -31,7 +31,7 @@
 | Dandanplay API or proxies become unavailable | High | Medium | High | Keep custom API override, last-good endpoint memory, and multiple proxy candidates |
 | Matching chooses the wrong anime or episode | Medium | Medium | Medium | Keep manual search/match flow, preference cache, and episode confirmation path available |
 | Overlay attaches to the wrong container after fullscreen or DOM rebuild | Medium | Medium | Medium | Rebind on route changes, DOM mutation, video replacement, and resize |
-| Skip-cue parsing matches an invalid timestamp string | Medium | Medium | Medium | Restrict parsing to `空降` suffix tokens, require at least `3s` lead over trigger time, and leave final playback validation to user manual checks |
+| Skip-cue parsing matches an invalid timestamp string | Medium | Medium | Medium | Restrict parsing to known skip keywords plus suffix time tokens, require at least `3s` lead over trigger time, and leave final playback validation to user manual checks |
 | Invalid or expensive regex filters degrade usability | Low | Medium | Low | Validate regex rules, surface invalid entries, and keep filtering before scheduling |
 
 ## High-Severity Risks

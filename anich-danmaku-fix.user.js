@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AniCh 弹弹 Play 弹幕
 // @namespace    https://anich.emmmm.eu.org/
-// @version      2.7.1
-// @description  AniCh 专用弹弹 Play 弹幕 userscript，提供外置工具条、过滤、显示区域和独立渲染。
+// @version      2.7.11
+// @description  AniCh 专用弹弹 Play 弹幕 userscript，提供页面内控制栏、过滤、显示区域和独立渲染。
 // @author       Codex
 // @match        https://anich.emmmm.eu.org/b/*
 // @run-at       document-start
@@ -38,6 +38,7 @@
   const SIMILAR_MERGE_OPT_IN_KEY = `${STORAGE_PREFIX}similarMergeOptIn`;
   const TOOLBAR_POSITION_KEY = `${STORAGE_PREFIX}toolbarPosition`;
   const STYLE_ID = "anich-ddm-style";
+  const RUNTIME_CLASS_PREFIX = "anich-ddm-";
   const DEBUG_NAMESPACE = "__anichDanmaku__";
   const OFFICIAL_API = "https://api.dandanplay.net/api/v2";
   const BILIBILI_API = "https://api.bilibili.com";
@@ -108,6 +109,9 @@
   const CONTROL_SETTING_DEBOUNCE_MS = 180;
   const DENSITY_BUCKET_SECONDS = 1;
   const CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS = 0.2;
+  const CROSS_SOURCE_OFFSET_SEARCH_SECONDS = 5;
+  const CROSS_SOURCE_OFFSET_BUCKET_SECONDS = 0.1;
+  const CROSS_SOURCE_OFFSET_MIN_MATCHES = 6;
   const PANEL_LABELS = Object.freeze({
     enabled: "开关",
     fontSize: "字号",
@@ -134,8 +138,8 @@
   const DANDANPLAY_SOURCE_KEY = "base:dandanplay";
   const BILIBILI_IMPORT_SOURCE_PREFIX = "import:bilibili";
   const TOP_BAR_TITLE = "AniCh 弹弹 Play";
-  const USER_AGENT = "AniChDanmakuFix/2.7.1";
-  const SKIP_CUE_KEYWORD = "空降";
+  const USER_AGENT = "AniChDanmakuFix/2.7.11";
+  const SKIP_CUE_KEYWORDS = Object.freeze(["空降", "跳伞", "指路", "传送", "跳转"]);
   const MIN_SKIP_CUE_LEAD_SECONDS = 3;
   const SKIP_PROMPT_DURATION_MS = 5000;
   const STOP_WORDS = new Set([
@@ -216,6 +220,23 @@
 
   function normalizeSpace(value) {
     return String(value || "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function hasClassPrefix(element, prefix) {
+    if (!element?.classList) {
+      return false;
+    }
+    return Array.from(element.classList).some((className) => String(className).startsWith(prefix));
+  }
+
+  function isRuntimeElementNode(node) {
+    if (!node || node.nodeType !== 1) {
+      return false;
+    }
+    return (
+      hasClassPrefix(node, RUNTIME_CLASS_PREFIX) ||
+      !!node.querySelector?.(`[class^="${RUNTIME_CLASS_PREFIX}"], [class*=" ${RUNTIME_CLASS_PREFIX}"]`)
+    );
   }
 
   function normalizeStringList(values) {
@@ -863,32 +884,56 @@
     return hours * 3600 + minutes * 60 + seconds;
   }
 
+  function findSkipCueMarkers(text) {
+    const normalizedText = normalizeSpace(text);
+    const markers = [];
+    SKIP_CUE_KEYWORDS.forEach((keyword) => {
+      let markerIndex = normalizedText.indexOf(keyword);
+      while (markerIndex >= 0) {
+        markers.push({
+          keyword,
+          index: markerIndex,
+        });
+        markerIndex = normalizedText.indexOf(keyword, markerIndex + keyword.length);
+      }
+    });
+    return markers.sort((left, right) => left.index - right.index || left.keyword.length - right.keyword.length);
+  }
+
+  function hasSkipCueKeyword(text) {
+    const normalizedText = normalizeSpace(text);
+    return SKIP_CUE_KEYWORDS.some((keyword) => normalizedText.includes(keyword));
+  }
+
   function extractSkipCue(text) {
     const normalizedText = normalizeSpace(text);
-    const markerIndex = normalizedText.indexOf(SKIP_CUE_KEYWORD);
-    if (markerIndex < 0) {
-      return null;
+    const markers = findSkipCueMarkers(normalizedText);
+    for (let index = 0; index < markers.length; index += 1) {
+      const marker = markers[index];
+      const nextMarker = markers[index + 1] || null;
+      const tail = normalizedText.slice(marker.index + marker.keyword.length, nextMarker?.index);
+      const tokenMatch = tail.match(/(\d+(?:[：:]\d{2}){1,2}|\d+\.\d{2})/);
+      if (!tokenMatch) {
+        continue;
+      }
+      const targetTime = parseSkipCueTimeToken(tokenMatch[1]);
+      if (!Number.isFinite(targetTime)) {
+        continue;
+      }
+      return {
+        targetTime,
+        targetLabel: formatClockTime(targetTime),
+        matchedToken: tokenMatch[1],
+        keyword: marker.keyword,
+      };
     }
-    const tail = normalizedText.slice(markerIndex + SKIP_CUE_KEYWORD.length);
-    const tokenMatch = tail.match(/(\d+(?:[：:]\d{2}){1,2}|\d+\.\d{2})/);
-    if (!tokenMatch) {
-      return null;
-    }
-    const targetTime = parseSkipCueTimeToken(tokenMatch[1]);
-    if (!Number.isFinite(targetTime)) {
-      return null;
-    }
-    return {
-      targetTime,
-      targetLabel: formatClockTime(targetTime),
-      matchedToken: tokenMatch[1],
-    };
+    return null;
   }
 
   function findFirstSkipCue(comments, minLeadSeconds = MIN_SKIP_CUE_LEAD_SECONDS) {
     const list = Array.isArray(comments) ? comments : [];
     for (const comment of list) {
-      if (!comment?.text || !comment.text.includes(SKIP_CUE_KEYWORD)) {
+      if (!comment?.text || !hasSkipCueKeyword(comment.text)) {
         continue;
       }
       const parsed = extractSkipCue(comment.text);
@@ -904,6 +949,7 @@
         triggerTime,
         targetTime: parsed.targetTime,
         targetLabel: parsed.targetLabel,
+        keyword: parsed.keyword,
         sourceText: comment.text,
       };
     }
@@ -1778,9 +1824,11 @@
         const count = safeNumber(entry?.count, 0);
         const acceptedCount = safeNumber(entry?.acceptedCount, count);
         const dedupedCount = safeNumber(entry?.dedupedCount, Math.max(0, count - acceptedCount));
+        const dedupeOffset = safeNumber(entry?.dedupeOffsetSeconds, 0);
+        const offsetText = Math.abs(dedupeOffset) > 0.05 ? ` / 对齐 ${dedupeOffset > 0 ? "+" : ""}${dedupeOffset.toFixed(1)}s` : "";
         const label = entry?.label || sourceKey;
         if (dedupedCount > 0 || acceptedCount !== count) {
-          return `${label}: 原始 ${count} 条（并入 ${acceptedCount} / 去重 ${dedupedCount}）`;
+          return `${label}: 原始 ${count} 条（并入 ${acceptedCount} / 去重 ${dedupedCount}${offsetText}）`;
         }
         return `${label}: ${count} 条`;
       })
@@ -1798,7 +1846,8 @@
   }
 
   function getDanmakuFuzzyKey(comment) {
-    const text = normalizeSpace(comment?.text || "");
+    const displayText = normalizeSpace(comment?.text || "");
+    const text = normalizeDanmakuSimilarityText(displayText) || displayText.toLowerCase();
     if (!text) {
       return "";
     }
@@ -1813,7 +1862,93 @@
     return Math.round(Math.max(0, safeNumber(time, 0)) / windowSize);
   }
 
-  function hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex, windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS) {
+  function getCrossSourceOffsetBucket(offsetSeconds) {
+    const bucketSize = Math.max(0.001, CROSS_SOURCE_OFFSET_BUCKET_SECONDS);
+    return Math.round(safeNumber(offsetSeconds, 0) / bucketSize) * bucketSize;
+  }
+
+  function collectCrossSourceCandidateTimes(key, time, priorFuzzyIndex, searchSeconds) {
+    const bucketMap = priorFuzzyIndex?.get(key);
+    if (!bucketMap) {
+      return [];
+    }
+    const windowSize = Math.max(0.001, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS);
+    const centerBucket = getDanmakuTimeBucket(time, windowSize);
+    const searchBuckets = Math.ceil(Math.max(windowSize, safeNumber(searchSeconds, 0)) / windowSize);
+    const candidates = [];
+    for (let offset = -searchBuckets; offset <= searchBuckets; offset += 1) {
+      const bucketCandidates = bucketMap.get(centerBucket + offset);
+      if (bucketCandidates?.length) {
+        candidates.push(...bucketCandidates);
+      }
+    }
+    return candidates;
+  }
+
+  function estimateCrossSourceTimeOffset(comments, priorFuzzyIndex) {
+    if (!priorFuzzyIndex || !priorFuzzyIndex.size) {
+      return 0;
+    }
+    const offsetCounts = new Map();
+    const seenKeys = new Set();
+    let sampleCount = 0;
+    const list = Array.isArray(comments) ? comments : [];
+    for (const comment of list) {
+      const key = getDanmakuFuzzyKey(comment);
+      if (!key || seenKeys.has(key)) {
+        continue;
+      }
+      const textKey = key.split("|", 1)[0] || "";
+      if (textKey.length < 3) {
+        continue;
+      }
+      seenKeys.add(key);
+      const time = safeNumber(comment?.time, 0);
+      const candidates = collectCrossSourceCandidateTimes(
+        key,
+        time,
+        priorFuzzyIndex,
+        CROSS_SOURCE_OFFSET_SEARCH_SECONDS
+      );
+      let bestDelta = null;
+      candidates.forEach((candidateTime) => {
+        const delta = safeNumber(candidateTime, 0) - time;
+        if (Math.abs(delta) > CROSS_SOURCE_OFFSET_SEARCH_SECONDS) {
+          return;
+        }
+        if (bestDelta === null || Math.abs(delta) < Math.abs(bestDelta)) {
+          bestDelta = delta;
+        }
+      });
+      if (bestDelta !== null) {
+        const bucket = getCrossSourceOffsetBucket(bestDelta);
+        offsetCounts.set(bucket, (offsetCounts.get(bucket) || 0) + 1);
+        sampleCount += 1;
+      }
+    }
+    if (!sampleCount) {
+      return 0;
+    }
+    let bestOffset = 0;
+    let bestCount = 0;
+    offsetCounts.forEach((count, offset) => {
+      if (count > bestCount || (count === bestCount && Math.abs(offset) < Math.abs(bestOffset))) {
+        bestOffset = offset;
+        bestCount = count;
+      }
+    });
+    if (bestCount < CROSS_SOURCE_OFFSET_MIN_MATCHES) {
+      return 0;
+    }
+    return Math.abs(bestOffset) <= CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS ? 0 : bestOffset;
+  }
+
+  function hasCrossSourceFuzzyDuplicate(
+    comment,
+    priorFuzzyIndex,
+    windowSeconds = CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS,
+    timeOffsetSeconds = 0
+  ) {
     if (!priorFuzzyIndex || !priorFuzzyIndex.size) {
       return false;
     }
@@ -1825,7 +1960,7 @@
     if (!bucketMap) {
       return false;
     }
-    const time = safeNumber(comment?.time, 0);
+    const time = safeNumber(comment?.time, 0) + safeNumber(timeOffsetSeconds, 0);
     const bucket = getDanmakuTimeBucket(time, windowSeconds);
     for (let offset = -1; offset <= 1; offset += 1) {
       const candidates = bucketMap.get(bucket + offset);
@@ -2702,6 +2837,7 @@
         pointer-events: none !important;
       }
 
+      :fullscreen .anich-ddm-control-dock,
       :fullscreen .anich-ddm-toolbar,
       :fullscreen .anich-ddm-panel,
       :fullscreen .anich-ddm-import-popover,
@@ -4110,6 +4246,214 @@
         font-size: 12px;
       }
 
+      .anich-ddm-control-dock,
+      .anich-ddm-control-dock .anich-ddm-toolbar,
+      .anich-ddm-control-dock .anich-ddm-import-popover,
+      .anich-ddm-control-dock .anich-ddm-panel {
+        --anich-control-blue: var(--blue, #0066cc);
+        --anich-control-focus: var(--blue, #0066cc);
+        --anich-control-ink: var(--after, #1d1d1f);
+        --anich-control-muted: var(--after, #6e6e73);
+        --anich-control-faint: var(--after, #86868b);
+        --anich-control-canvas: var(--before, #ffffff);
+        --anich-control-canvas-strong: var(--before, #ffffff);
+        --anich-control-card: var(--bg, #f6f7f8);
+        --anich-control-chip: var(--bg, #f6f7f8);
+        --anich-control-chip-hover: var(--before, #ffffff);
+        --anich-control-hairline: var(--border-color, rgba(0, 0, 0, 0.08));
+        --anich-control-soft-line: var(--border-color, rgba(0, 0, 0, 0.04));
+        --anich-control-radius-md: 0.6rem;
+        --anich-control-radius-lg: 0.7rem;
+      }
+
+      .anich-ddm-control-dock {
+        position: relative;
+        z-index: 2147483003;
+        width: 100%;
+        margin-top: 0.8rem;
+        padding: 0.7rem;
+        border-radius: 0.7rem;
+        border: 0.1rem solid var(--border-color, rgba(0, 0, 0, 0.08));
+        background: var(--before, #ffffff);
+        color: var(--after, #1d1d1f);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+        font-size: 14px;
+        line-height: 1.47;
+        letter-spacing: 0;
+        color-scheme: light;
+        box-shadow: none;
+        pointer-events: auto !important;
+        isolation: isolate;
+      }
+
+      section[player-block] > .anich-ddm-control-dock {
+        width: calc(100% - 35rem);
+      }
+
+      .anich-ddm-control-dock,
+      .anich-ddm-control-dock * {
+        box-sizing: border-box;
+        pointer-events: auto !important;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar {
+        position: static !important;
+        inset: auto !important;
+        transform: none !important;
+        z-index: 1;
+        width: 100%;
+        min-height: 2.9rem;
+        display: grid;
+        grid-template-columns: minmax(6rem, auto) minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0.7rem;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        color: var(--anich-control-ink);
+        box-shadow: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar:hover {
+        background: transparent;
+        border-color: transparent;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-label {
+        min-width: 0;
+        min-height: 2.5rem;
+        padding: 0;
+        color: var(--anich-control-ink);
+        font-size: 1rem;
+        font-weight: 700;
+        cursor: default;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-label::before {
+        width: 0.5rem;
+        height: 0.5rem;
+        box-shadow: none;
+        color: var(--anich-control-blue);
+        background: currentColor;
+        opacity: 1;
+      }
+
+      .anich-ddm-toolbar-status {
+        min-width: 0;
+        color: var(--anich-control-muted);
+        font-size: 0.82rem;
+        line-height: 1.35;
+        opacity: 0.72;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .anich-ddm-toolbar-actions {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 0.45rem;
+        position: relative;
+        z-index: 2;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-button {
+        width: 2.5rem;
+        min-width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 0.7rem;
+        border: 0.1rem solid var(--border-color, rgba(0, 0, 0, 0.08));
+        background: var(--bg, #f6f7f8);
+        color: var(--anich-control-ink);
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-button:hover {
+        background: var(--before, #ffffff);
+        border-color: var(--anich-control-blue);
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-button.is-active {
+        background: var(--anich-control-blue);
+        border-color: var(--anich-control-blue);
+        color: #ffffff;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-toolbar-button.is-disabled {
+        opacity: 0.62;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-panel {
+        position: static !important;
+        inset: auto !important;
+        width: 100% !important;
+        max-width: none;
+        max-height: min(72vh, 46rem);
+        margin-top: 0.7rem;
+        border: 0;
+        border-top: 0.1rem solid var(--border-color, rgba(0, 0, 0, 0.08));
+        border-radius: 0;
+        background: transparent;
+        box-shadow: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        opacity: 1;
+        visibility: visible;
+        transform: none !important;
+        pointer-events: auto;
+        display: none !important;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-panel.is-open {
+        display: flex !important;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-panel-head {
+        padding: 0.75rem 0 0.65rem;
+        border-bottom: 0.1rem solid var(--border-color, rgba(0, 0, 0, 0.08));
+        background: transparent;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-tabs {
+        margin: 0.75rem 0 0;
+        background: var(--bg, #f6f7f8);
+      }
+
+      .anich-ddm-control-dock .anich-ddm-sections {
+        padding: 0.75rem 0 0;
+      }
+
+      .anich-ddm-control-dock .anich-ddm-card,
+      .anich-ddm-control-dock .anich-ddm-mode-item,
+      .anich-ddm-control-dock .anich-ddm-import-summary,
+      .anich-ddm-control-dock .anich-ddm-import-item {
+        border-color: var(--border-color, rgba(0, 0, 0, 0.08));
+        border-radius: 0.7rem;
+        background: var(--bg, #f6f7f8);
+      }
+
+      .anich-ddm-control-dock .anich-ddm-import-popover {
+        position: absolute !important;
+        top: auto !important;
+        bottom: calc(100% + 0.55rem) !important;
+        right: 0 !important;
+        left: auto !important;
+        z-index: 2147483002;
+        width: min(34rem, 100%) !important;
+        max-height: min(70vh, 36rem);
+        overflow: auto;
+        border: 0.1rem solid var(--border-color, rgba(0, 0, 0, 0.08));
+        border-radius: 0.7rem;
+        background: var(--before, #ffffff);
+        box-shadow: var(--shadow, 0 0.7rem 2rem rgba(0, 0, 0, 0.16));
+        transform-origin: right bottom;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+      }
+
       @media (max-width: 640px) {
         .anich-ddm-toolbar {
           min-height: 52px;
@@ -4156,6 +4500,47 @@
         .anich-ddm-actions,
         .anich-ddm-footer {
           grid-template-columns: 1fr;
+        }
+
+        .anich-ddm-control-dock {
+          padding: 0.6rem;
+        }
+
+        .anich-ddm-control-dock .anich-ddm-toolbar {
+          min-height: auto;
+          grid-template-columns: minmax(0, 1fr) auto;
+          padding: 0;
+          gap: 0.55rem;
+        }
+
+        .anich-ddm-control-dock .anich-ddm-toolbar-status {
+          grid-column: 1 / -1;
+          grid-row: 2;
+        }
+
+        .anich-ddm-control-dock .anich-ddm-toolbar-label {
+          min-width: 0;
+          min-height: 2.4rem;
+          padding: 0;
+          font-size: 0.95rem;
+        }
+
+        .anich-ddm-control-dock .anich-ddm-toolbar-button {
+          width: 2.4rem;
+          min-width: 2.4rem;
+          height: 2.4rem;
+        }
+
+        .anich-ddm-control-dock .anich-ddm-panel,
+        .anich-ddm-control-dock .anich-ddm-import-popover {
+          width: 100% !important;
+          max-width: 100%;
+        }
+      }
+
+      @media screen and (max-width: 70rem) {
+        section[player-block] > .anich-ddm-control-dock {
+          width: 100%;
         }
       }
 
@@ -4673,6 +5058,9 @@
         if (episodeId == null && meta.episodeId != null) {
           episodeId = meta.episodeId;
         }
+        const dedupeOffsetSeconds =
+          sourceIndex > 0 ? estimateCrossSourceTimeOffset(bucketComments, priorFuzzyIndex) : 0;
+        sourceBreakdown[sourceKey].dedupeOffsetSeconds = dedupeOffsetSeconds;
         const acceptedComments = [];
         for (const comment of bucketComments) {
           const uniqueId = getDanmakuMergeKey(comment);
@@ -4681,7 +5069,12 @@
           }
           if (
             sourceIndex > 0 &&
-            hasCrossSourceFuzzyDuplicate(comment, priorFuzzyIndex, CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS)
+            hasCrossSourceFuzzyDuplicate(
+              comment,
+              priorFuzzyIndex,
+              CROSS_SOURCE_DUPLICATE_WINDOW_SECONDS,
+              dedupeOffsetSeconds
+            )
           ) {
             continue;
           }
@@ -4730,6 +5123,9 @@
       this.topLanes = [];
       this.bottomLanes = [];
       this.paused = false;
+      this.textWidthCache = new Map();
+      this.handleAnimationEnd = this.handleAnimationEnd.bind(this);
+      this.handleResize = this.handleResize.bind(this);
     }
 
     attach(container) {
@@ -4748,6 +5144,9 @@
         container.style.position = "relative";
       }
 
+      if (this.layer) {
+        this.layer.removeEventListener("animationend", this.handleAnimationEnd);
+      }
       if (this.overlay?.isConnected) {
         this.overlay.remove();
       }
@@ -4758,25 +5157,37 @@
       this.measureNode.style.visibility = "hidden";
       this.measureNode.style.pointerEvents = "none";
       this.overlay.append(this.layer, this.measureNode);
+      this.layer.addEventListener("animationend", this.handleAnimationEnd);
       container.appendChild(this.overlay);
 
-      this.resizeObserver = new ResizeObserver(() => {
-        this.updateBounds();
-        this.clear();
-        this.session.scheduler.refreshFromCurrentTime(false);
-      });
+      this.resizeObserver = new ResizeObserver(this.handleResize);
       this.resizeObserver.observe(container);
-      this.updateBounds();
+      this.updateBounds(true);
     }
 
-    updateBounds() {
-      if (!this.container) {
+    handleResize() {
+      if (!this.updateBounds()) {
         return;
       }
+      this.clear();
+      this.session.scheduler.refreshFromCurrentTime(false);
+    }
+
+    updateBounds(force = false) {
+      if (!this.container) {
+        return false;
+      }
       const rect = this.container.getBoundingClientRect();
-      this.width = rect.width || this.container.clientWidth || 0;
-      this.height = rect.height || this.container.clientHeight || 0;
+      const width = rect.width || this.container.clientWidth || 0;
+      const height = rect.height || this.container.clientHeight || 0;
+      const changed = force || Math.abs(width - this.width) > 0.5 || Math.abs(height - this.height) > 0.5;
+      this.width = width;
+      this.height = height;
+      if (!changed) {
+        return false;
+      }
       this.resetLanes();
+      return true;
     }
 
     destroyObserver() {
@@ -4788,6 +5199,9 @@
 
     destroy() {
       this.destroyObserver();
+      if (this.layer) {
+        this.layer.removeEventListener("animationend", this.handleAnimationEnd);
+      }
       if (this.overlay?.isConnected) {
         this.overlay.remove();
       }
@@ -4795,6 +5209,7 @@
       this.layer = null;
       this.container = null;
       this.measureNode = null;
+      this.textWidthCache.clear();
       this.resetLanes();
     }
 
@@ -4816,6 +5231,30 @@
       this.resetLanes();
     }
 
+    handleAnimationEnd(event) {
+      const node = event.target;
+      if (node?.parentNode === this.layer && node.classList?.contains("anich-ddm-item")) {
+        node.remove();
+      }
+    }
+
+    getCommentWidth(text, fontSize) {
+      const key = `${fontSize}\n${text}`;
+      const cached = this.textWidthCache.get(key);
+      if (cached) {
+        return cached;
+      }
+      this.measureNode.style.fontSize = `${fontSize}px`;
+      this.measureNode.style.fontWeight = "700";
+      this.measureNode.textContent = text;
+      const width = Math.max(24, this.measureNode.offsetWidth || fontSize * Math.max(text.length, 1));
+      this.textWidthCache.set(key, width);
+      if (this.textWidthCache.size > 2048) {
+        this.textWidthCache.delete(this.textWidthCache.keys().next().value);
+      }
+      return width;
+    }
+
     syncPaused(isPaused) {
       if (!this.overlay) {
         return;
@@ -4827,9 +5266,9 @@
       this.overlay.classList.toggle("is-paused", isPaused);
     }
 
-    emit(comment) {
+    createCommentNode(comment) {
       if (!this.layer || !this.overlay || !this.width || !this.height) {
-        return;
+        return null;
       }
 
       const settings = this.session.settings;
@@ -4838,10 +5277,7 @@
       node.style.fontSize = `${settings.fontSize}px`;
       node.style.setProperty("--ddm-opacity", String(settings.opacity));
       node.style.color = comment.color || "#ffffff";
-      this.measureNode.style.fontSize = node.style.fontSize;
-      this.measureNode.style.fontWeight = "700";
-      this.measureNode.textContent = comment.text;
-      const commentWidth = Math.max(24, this.measureNode.offsetWidth || settings.fontSize * Math.max(comment.text.length, 1));
+      const commentWidth = this.getCommentWidth(comment.text, settings.fontSize);
       const rowHeight = Math.max(24, settings.fontSize + 8);
       const now = performance.now();
 
@@ -4870,14 +5306,34 @@
         node.style.animation = `anich-ddm-scroll ${duration}ms linear forwards`;
       }
 
-      node.addEventListener(
-        "animationend",
-        () => {
-          node.remove();
-        },
-        { once: true }
-      );
-      this.layer.appendChild(node);
+      return node;
+    }
+
+    emit(comment) {
+      const node = this.createCommentNode(comment);
+      if (node) {
+        this.layer.appendChild(node);
+      }
+    }
+
+    emitMany(comments) {
+      if (!this.layer || !Array.isArray(comments) || !comments.length) {
+        return 0;
+      }
+      const fragment = document.createDocumentFragment();
+      let count = 0;
+      comments.forEach((comment) => {
+        const node = this.createCommentNode(comment);
+        if (!node) {
+          return;
+        }
+        fragment.appendChild(node);
+        count += 1;
+      });
+      if (count) {
+        this.layer.appendChild(fragment);
+      }
+      return count;
     }
 
     pickScrollLane(mode, now, rowHeight) {
@@ -4945,6 +5401,7 @@
         shownAt: 0,
         lastAction: "idle",
         lastCueId: null,
+        keyword: "",
         targetLabel: "",
         targetTime: null,
         remainingSeconds: 0,
@@ -5081,6 +5538,9 @@
       this.activeCue = Object.assign({}, skipCue);
       this.remainingMs = SKIP_PROMPT_DURATION_MS;
       this.paused = false;
+      if (this.eyebrow) {
+        this.eyebrow.textContent = `检测到${skipCue.keyword || "跳转"}`;
+      }
       this.title.textContent = "点击跳过片头";
       this.button.title = `跳转至 ${skipCue.targetLabel}`;
       this.button.disabled = false;
@@ -5092,6 +5552,7 @@
         shownAt: Date.now(),
         lastAction: "shown",
         lastCueId: skipCue.sourceCommentId || null,
+        keyword: skipCue.keyword || "",
         targetLabel: skipCue.targetLabel || "",
         targetTime: safeNumber(skipCue.targetTime, null),
         remainingSeconds: Math.ceil(SKIP_PROMPT_DURATION_MS / 1000),
@@ -5116,6 +5577,7 @@
       this.state.lastAction = reason;
       this.state.remainingSeconds = 0;
       this.state.paused = false;
+      this.state.keyword = "";
       if (reason === "reset" || reason === "rearm" || reason === "destroy") {
         this.activeCue = null;
       }
@@ -5145,6 +5607,7 @@
         shownAt: this.state.shownAt,
         lastAction: this.state.lastAction,
         lastCueId: this.state.lastCueId,
+        keyword: this.state.keyword,
         targetLabel: this.state.targetLabel,
         targetTime: this.state.targetTime,
         remainingSeconds: this.state.remainingSeconds,
@@ -5176,9 +5639,16 @@
       this.comments = [];
       this.cursor = 0;
       this.frameId = 0;
+      this.timerId = 0;
       this.lastTargetTime = null;
+      this.lastTickAt = null;
       this.lastVideo = null;
       this.running = false;
+      this.densityConfig = getDensityLimitConfig(
+        this.session.settings,
+        this.session.getDensityDurationSeconds(),
+        []
+      );
       this.skipCue = null;
       this.skipCueState = this.createSkipCueState(null, 0);
       this.emitStats = {
@@ -5191,6 +5661,10 @@
         totalDroppedSingle: 0,
       };
       this.tick = this.tick.bind(this);
+      this.handleVideoPlay = this.handleVideoPlay.bind(this);
+      this.handleVideoPause = this.handleVideoPause.bind(this);
+      this.handleVideoSeek = this.handleVideoSeek.bind(this);
+      this.handleVideoRateChange = this.handleVideoRateChange.bind(this);
     }
 
     createSkipCueState(skipCue, targetTime) {
@@ -5216,8 +5690,9 @@
 
     setComments(comments) {
       this.comments = Array.isArray(comments) ? comments : [];
+      this.updateDensityConfig();
       this.refreshFromCurrentTime(false);
-      this.start();
+      this.syncPlaybackLoop();
     }
 
     setSkipCue(skipCue) {
@@ -5225,40 +5700,139 @@
       const targetTime = (this.session.video?.currentTime || 0) + this.session.settings.offset;
       this.skipCueState = this.createSkipCueState(this.skipCue, targetTime);
       this.session.skipPrompt.dismiss("reset");
+      this.syncPlaybackLoop();
     }
 
     setVideo(video) {
       if (this.lastVideo && this.lastVideo !== video) {
+        this.detachVideoListeners(this.lastVideo);
         this.session.skipPrompt.dismiss("rebind");
       }
       this.lastVideo = video || null;
-      this.refreshFromCurrentTime(false);
       if (video) {
-        this.start();
+        this.attachVideoListeners(video);
+      }
+      this.updateDensityConfig();
+      this.refreshFromCurrentTime(false);
+      this.syncPlaybackLoop();
+    }
+
+    attachVideoListeners(video) {
+      if (!video) {
+        return;
+      }
+      video.addEventListener("play", this.handleVideoPlay);
+      video.addEventListener("playing", this.handleVideoPlay);
+      video.addEventListener("pause", this.handleVideoPause);
+      video.addEventListener("ended", this.handleVideoPause);
+      video.addEventListener("seeking", this.handleVideoSeek);
+      video.addEventListener("seeked", this.handleVideoSeek);
+      video.addEventListener("ratechange", this.handleVideoRateChange);
+    }
+
+    detachVideoListeners(video) {
+      if (!video) {
+        return;
+      }
+      video.removeEventListener("play", this.handleVideoPlay);
+      video.removeEventListener("playing", this.handleVideoPlay);
+      video.removeEventListener("pause", this.handleVideoPause);
+      video.removeEventListener("ended", this.handleVideoPause);
+      video.removeEventListener("seeking", this.handleVideoSeek);
+      video.removeEventListener("seeked", this.handleVideoSeek);
+      video.removeEventListener("ratechange", this.handleVideoRateChange);
+    }
+
+    handleVideoPlay() {
+      this.session.renderer.syncPaused(false);
+      this.syncPlaybackLoop();
+    }
+
+    handleVideoPause() {
+      this.session.renderer.syncPaused(true);
+      this.syncPlaybackLoop();
+    }
+
+    handleVideoSeek() {
+      this.refreshFromCurrentTime(true);
+      this.syncPlaybackLoop();
+    }
+
+    handleVideoRateChange() {
+      this.syncPlaybackLoop();
+    }
+
+    hasSkipCueWork(video = this.session.video) {
+      if (!this.skipCue || !video || this.skipCueState.clicked) {
+        return false;
+      }
+      if (this.session.skipPrompt.isVisible()) {
+        return true;
+      }
+      const targetTime = video.currentTime + this.session.settings.offset;
+      return !this.skipCueState.dismissed && targetTime < this.skipCue.targetTime - 0.05;
+    }
+
+    hasPlaybackWork(video = this.session.video) {
+      const hasEnabledComments = this.session.settings.enabled && this.cursor < this.comments.length;
+      return (
+        !!video &&
+        !video.paused &&
+        !video.ended &&
+        (hasEnabledComments || this.hasSkipCueWork(video))
+      );
+    }
+
+    syncPlaybackLoop() {
+      const video = this.session.video;
+      if (video) {
+        this.session.renderer.syncPaused(video.paused);
+      }
+      if (this.hasPlaybackWork(video)) {
+        if (this.running) {
+          this.scheduleNextTick();
+        } else {
+          this.start();
+        }
+      } else {
+        this.stop();
       }
     }
 
     start() {
-      if (this.running) {
+      if (this.running || !this.hasPlaybackWork()) {
         return;
       }
       this.running = true;
-      this.frameId = requestAnimationFrame(this.tick);
+      this.scheduleNextTick();
     }
 
-    stop() {
-      this.running = false;
+    clearWakeHandles() {
       if (this.frameId) {
         cancelAnimationFrame(this.frameId);
         this.frameId = 0;
       }
+      if (this.timerId) {
+        clearTimeout(this.timerId);
+        this.timerId = 0;
+      }
+    }
+
+    stop() {
+      this.running = false;
+      this.clearWakeHandles();
     }
 
     destroy() {
       this.stop();
+      this.detachVideoListeners(this.lastVideo);
       this.comments = [];
       this.cursor = 0;
+      this.timerId = 0;
       this.lastTargetTime = null;
+      this.lastTickAt = null;
+      this.lastVideo = null;
+      this.updateDensityConfig();
       this.skipCue = null;
       this.skipCueState = this.createSkipCueState(null, 0);
       this.emitStats = {
@@ -5272,11 +5846,80 @@
       };
     }
 
+    updateDensityConfig() {
+      this.densityConfig = getDensityLimitConfig(
+        this.session.settings,
+        this.session.getDensityDurationSeconds(),
+        this.comments
+      );
+    }
+
+    getDensityConfig() {
+      if (!this.densityConfig) {
+        this.updateDensityConfig();
+      }
+      return this.densityConfig;
+    }
+
+    getNextWakeDelayMs() {
+      const video = this.session.video;
+      if (!video) {
+        return 0;
+      }
+      const playbackRate = Math.max(0.05, Math.abs(safeNumber(video.playbackRate, 1)) || 1);
+      const currentTargetTime = video.currentTime + this.session.settings.offset;
+      const wakeTimes = [];
+      if (this.session.settings.enabled && this.cursor < this.comments.length) {
+        wakeTimes.push(this.comments[this.cursor].time - 0.05);
+      }
+      if (this.hasSkipCueWork(video)) {
+        const triggerTime = this.skipCue.triggerTime - 0.05;
+        const targetTime = this.skipCue.targetTime - 0.05;
+        if (this.session.skipPrompt.isVisible()) {
+          wakeTimes.push(targetTime);
+        } else if (currentTargetTime < triggerTime) {
+          wakeTimes.push(triggerTime);
+        } else {
+          wakeTimes.push(Math.min(targetTime, currentTargetTime));
+        }
+      }
+      if (!wakeTimes.length) {
+        return 0;
+      }
+      const nextWakeTime = Math.min(...wakeTimes);
+      return Math.max(0, ((nextWakeTime - currentTargetTime) / playbackRate) * 1000);
+    }
+
+    scheduleNextTick(delayMs = this.getNextWakeDelayMs()) {
+      if (!this.running) {
+        return;
+      }
+      if (!this.hasPlaybackWork()) {
+        this.stop();
+        return;
+      }
+      this.clearWakeHandles();
+      const delay = Math.max(0, safeNumber(delayMs, 0));
+      if (delay <= 34) {
+        this.frameId = requestAnimationFrame(this.tick);
+        return;
+      }
+      this.timerId = setTimeout(() => {
+        this.timerId = 0;
+        if (!this.running || !this.hasPlaybackWork()) {
+          this.syncPlaybackLoop();
+          return;
+        }
+        this.frameId = requestAnimationFrame(this.tick);
+      }, delay);
+    }
+
     refreshFromCurrentTime(clearOverlay = true) {
       const video = this.session.video;
       const targetTime = (video?.currentTime || 0) + this.session.settings.offset;
       this.cursor = this.lowerBound(targetTime);
       this.lastTargetTime = targetTime;
+      this.lastTickAt = performance.now();
       if (clearOverlay) {
         this.session.renderer.clear();
       }
@@ -5382,6 +6025,7 @@
         dismissed: true,
         reason: "timeout",
       });
+      this.syncPlaybackLoop();
     }
 
     markSkipCueClicked() {
@@ -5394,6 +6038,7 @@
         clicked: true,
         reason: "clicked",
       });
+      this.syncPlaybackLoop();
     }
 
     getSkipCueDebugState() {
@@ -5404,27 +6049,19 @@
     }
 
     getEmitLimit() {
-      return getDensityLimitConfig(
-        this.session.settings,
-        this.session.getDensityDurationSeconds(),
-        this.comments
-      ).maxEmitPerFrame;
+      return this.getDensityConfig().maxEmitPerFrame;
     }
 
     emitDueComments(targetTime) {
       const cutoffTime = targetTime + 0.05;
-      const config = getDensityLimitConfig(
-        this.session.settings,
-        this.session.getDensityDurationSeconds(),
-        this.comments
-      );
+      const config = this.getDensityConfig();
       const dueComments = [];
       while (this.cursor < this.comments.length && this.comments[this.cursor].time <= cutoffTime) {
         dueComments.push(this.comments[this.cursor]);
         this.cursor += 1;
       }
       const limited = limitDanmakuByDensity(dueComments, config.maxEmitPerFrame, config.preferMergedComments);
-      limited.comments.forEach((comment) => this.session.renderer.emit(comment));
+      this.session.renderer.emitMany(limited.comments);
       const emitted = limited.comments.length;
       const dropped = dueComments.length - emitted;
       this.emitStats.lastFrameEmitted = emitted;
@@ -5449,27 +6086,37 @@
     }
 
     tick() {
+      this.frameId = 0;
       if (!this.running || this.session.destroyed) {
         return;
       }
       const video = this.session.video;
       if (!video) {
-        this.frameId = requestAnimationFrame(this.tick);
+        this.running = false;
         return;
       }
 
       this.session.renderer.syncPaused(video.paused);
       if (this.comments.length || this.skipCue) {
+        const now = performance.now();
         const targetTime = video.currentTime + this.session.settings.offset;
+        const playbackRate = Math.max(0.05, Math.abs(safeNumber(video.playbackRate, 1)) || 1);
+        const elapsedSeconds =
+          this.lastTickAt !== null ? Math.max(0, (now - this.lastTickAt) / 1000) : 0;
+        const expectedAdvance = elapsedSeconds * playbackRate + 0.75;
+        const forwardJump =
+          this.lastTargetTime !== null &&
+          targetTime - this.lastTargetTime > Math.max(1.5, expectedAdvance);
         if (
           this.lastTargetTime === null ||
-          Math.abs(targetTime - this.lastTargetTime) > 1.5 ||
+          forwardJump ||
           targetTime < this.lastTargetTime - 0.35
         ) {
           this.refreshFromCurrentTime(true);
         }
         const previousTargetTime = this.lastTargetTime;
         this.lastTargetTime = targetTime;
+        this.lastTickAt = now;
         this.maybeShowSkipCue(previousTargetTime, targetTime, video.paused);
 
         if (this.session.settings.enabled && this.comments.length && !video.paused) {
@@ -5477,7 +6124,11 @@
         }
       }
 
-      this.frameId = requestAnimationFrame(this.tick);
+      if (this.hasPlaybackWork(video)) {
+        this.scheduleNextTick();
+      } else {
+        this.running = false;
+      }
     }
   }
 
@@ -5487,8 +6138,10 @@
       this.playerContainer = null;
       this.overlay = null;
       this.toolbarHost = null;
+      this.controlDock = null;
       this.toolbar = null;
       this.toolbarHandle = null;
+      this.toolbarStatus = null;
       this.panel = null;
       this.panelSubtitle = null;
       this.panelState = null;
@@ -5574,26 +6227,30 @@
       if (!this.toolbarHost) {
         return;
       }
-      if (!this.toolbar?.isConnected || this.toolbar.parentElement !== this.toolbarHost) {
+      const controlParent = this.ensureControlDock(this.toolbarHost);
+      if (!controlParent) {
+        return;
+      }
+      if (!this.toolbar?.isConnected || this.toolbar.parentElement !== controlParent) {
         if (this.toolbar?.isConnected) {
           this.toolbar.remove();
         }
-        this.buildToolbar(this.toolbarHost);
+        this.buildToolbar(controlParent);
       }
-      if (!this.panel?.isConnected || this.panel.parentElement !== this.toolbarHost) {
+      if (!this.panel?.isConnected || this.panel.parentElement !== controlParent) {
         if (this.panel?.isConnected) {
           this.panel.remove();
         }
-        this.buildPanel(this.toolbarHost);
+        this.buildPanel(controlParent);
         if (panelWasOpen) {
           this.panel.classList.add("is-open");
         }
       }
-      if (!this.importPopover?.isConnected || this.importPopover.parentElement !== this.toolbarHost) {
+      if (!this.importPopover?.isConnected || this.importPopover.parentElement !== controlParent) {
         if (this.importPopover?.isConnected) {
           this.importPopover.remove();
         }
-        this.buildImportPopover(this.toolbarHost);
+        this.buildImportPopover(controlParent);
         if (importWasOpen) {
           this.importPopover.classList.add("is-open");
         }
@@ -5615,6 +6272,44 @@
       return document.fullscreenElement instanceof Element;
     }
 
+    isControlDockActive() {
+      return !!this.controlDock?.isConnected;
+    }
+
+    ensureControlDock(host) {
+      if (!(host instanceof HTMLElement)) {
+        return host;
+      }
+      if (this.controlDock?.isConnected && this.controlDock.parentElement === host) {
+        return this.controlDock;
+      }
+      if (this.controlDock?.isConnected) {
+        this.controlDock.remove();
+      }
+
+      const existingDock = host.querySelector(":scope > .anich-ddm-control-dock");
+      if (existingDock instanceof HTMLElement) {
+        this.controlDock = existingDock;
+        return existingDock;
+      }
+
+      const dock = createElement("section", "anich-ddm-control-dock");
+      dock.dataset.anichDdmControlDock = "true";
+      const playerWrap = host.querySelector(":scope > section[player-wrap]");
+      if (playerWrap instanceof Element && playerWrap.parentElement === host) {
+        playerWrap.insertAdjacentElement("afterend", dock);
+      } else {
+        const playerInfo = host.querySelector(":scope > section[player-info]");
+        if (playerInfo instanceof Element && playerInfo.parentElement === host) {
+          host.insertBefore(dock, playerInfo);
+        } else {
+          host.appendChild(dock);
+        }
+      }
+      this.controlDock = dock;
+      return dock;
+    }
+
     detachControlNodes() {
       document.removeEventListener("pointerdown", this.handleDocumentPointerDown, true);
       this.stopToolbarDrag(false);
@@ -5634,6 +6329,7 @@
       }
       this.toolbar = null;
       this.toolbarHandle = null;
+      this.toolbarStatus = null;
       this.settingsEntry = null;
       this.toggleEntry = null;
       this.importPopover = null;
@@ -5659,6 +6355,7 @@
       }
       this.toolbar = null;
       this.toolbarHandle = null;
+      this.toolbarStatus = null;
       this.settingsEntry = null;
       this.toggleEntry = null;
       if (this.importPopover?.isConnected) {
@@ -5738,6 +6435,10 @@
     }
 
     releaseToolbarHost() {
+      if (this.controlDock?.isConnected) {
+        this.controlDock.remove();
+      }
+      this.controlDock = null;
       if (this.toolbarHost instanceof HTMLElement && this.hostInlineStyles) {
         this.toolbarHost.style.position = this.hostInlineStyles.position;
         this.toolbarHost.style.overflow = this.hostInlineStyles.overflow;
@@ -5768,6 +6469,15 @@
       if (!this.toolbar) {
         return;
       }
+      if (this.isControlDockActive()) {
+        this.toolbar.style.top = "";
+        this.toolbar.style.left = "";
+        this.toolbar.style.right = "";
+        this.toolbar.style.transform = "";
+        this.applyPanelPosition();
+        this.applyImportPopoverPosition();
+        return;
+      }
       const next = this.getResolvedToolbarPosition();
       const changed = next.side !== this.toolbarPosition.side || next.top !== this.toolbarPosition.top;
       this.toolbarPosition = {
@@ -5793,6 +6503,12 @@
 
     applyPanelPosition() {
       if (!this.panel || !this.toolbar) {
+        return;
+      }
+      if (this.isControlDockActive()) {
+        this.panel.style.width = "";
+        this.panel.style.left = "";
+        this.panel.style.top = "";
         return;
       }
       const toolbarRect = this.toolbar.getBoundingClientRect();
@@ -5834,6 +6550,13 @@
 
     applyImportPopoverPosition() {
       if (!this.importPopover || !this.settingsEntry) {
+        return;
+      }
+      if (this.isControlDockActive()) {
+        this.importPopover.style.left = "";
+        this.importPopover.style.top = "";
+        this.importPopover.style.right = "";
+        this.importPopover.style.bottom = "";
         return;
       }
       const anchorRect = this.settingsEntry.getBoundingClientRect();
@@ -5880,6 +6603,7 @@
       }
       this.clearImportPopoverCloseTimer();
       this.importPopover.classList.add("is-open");
+      this.updateImportState();
       this.applyImportPopoverPosition();
     }
 
@@ -6053,9 +6777,10 @@
     buildToolbar(parent) {
       this.toolbar = createElement("div", "anich-ddm-toolbar");
       this.toolbar.dataset.anichDdmToolbar = "true";
-      const label = createElement("div", "anich-ddm-toolbar-label", "弹幕");
-      label.title = "按住拖动工具条";
+      const label = createElement("div", "anich-ddm-toolbar-label", "弹幕控制");
+      label.title = "弹幕控制栏";
       label.addEventListener("pointerdown", this.handleToolbarPointerDown);
+      this.toolbarStatus = createElement("div", "anich-ddm-toolbar-status");
       const toggleButton = createElement("button", "anich-ddm-toolbar-button");
       toggleButton.type = "button";
       toggleButton.dataset.anichDdmRole = "toggle";
@@ -6075,7 +6800,9 @@
       this.toolbarHandle = label;
       this.settingsEntry = settingsButton;
       this.toggleEntry = toggleButton;
-      this.toolbar.append(label, toggleButton, settingsButton);
+      const actions = createElement("div", "anich-ddm-toolbar-actions");
+      actions.append(toggleButton, settingsButton);
+      this.toolbar.append(label, this.toolbarStatus, actions);
       parent.appendChild(this.toolbar);
     }
 
@@ -6146,7 +6873,7 @@
       const head = createElement("div", "anich-ddm-panel-head");
       const titleBox = createElement("div", "anich-ddm-panel-titlebox");
       const title = createElement("div", "anich-ddm-panel-title", TOP_BAR_TITLE);
-      this.panelSubtitle = createElement("div", "anich-ddm-panel-subtitle", "外置工具条入口");
+      this.panelSubtitle = createElement("div", "anich-ddm-panel-subtitle", "页面内弹幕控制");
       this.panelState = createElement("div", "anich-ddm-panel-state");
       titleBox.append(title, this.panelSubtitle);
       const closeButton = createElement("button", "anich-ddm-button", "关闭");
@@ -6455,7 +7182,7 @@
       });
       inline.append(this.apiInput, apiSaveButton);
       sourceCard.appendChild(inline);
-      sourceCard.appendChild(createElement("div", "anich-ddm-card-note", "外置工具条是唯一入口，AniCh 原生控件保持站点默认行为。"));
+      sourceCard.appendChild(createElement("div", "anich-ddm-card-note", "页面内控制栏是唯一入口，AniCh 原生控件保持站点默认行为。"));
 
       const statusCard = createElement("div", "anich-ddm-card");
       statusCard.appendChild(createElement("div", "anich-ddm-card-title", "状态"));
@@ -6540,6 +7267,7 @@
         return;
       }
       this.panel.classList.add("is-open");
+      this.updatePanelState();
       this.applyPanelPosition();
       this.syncControlStates();
     }
@@ -6589,6 +7317,9 @@
     }
 
     handleToolbarPointerDown(event) {
+      if (this.isControlDockActive()) {
+        return;
+      }
       if (event.button !== 0 || !this.toolbarHost || !this.toolbar) {
         return;
       }
@@ -6941,24 +7672,81 @@
       }
     }
 
-    update() {
+    isPanelOpen() {
+      return !!this.panel?.classList.contains("is-open");
+    }
+
+    isImportPopoverOpen() {
+      return !!this.importPopover?.classList.contains("is-open");
+    }
+
+    updateToolbarState() {
+      const session = this.session;
+      const match = session.currentMatch;
+      const settings = session.settings;
+      if (this.panelSubtitle) {
+        this.panelSubtitle.textContent = "页面内弹幕控制";
+      }
+      if (this.panelState) {
+        this.panelState.textContent = [session.statusLabel, match ? "已匹配" : "待匹配"].join("\n");
+      }
+      if (this.toolbarStatus) {
+        const loaded = safeNumber(session.store.stats.visibleCount, session.store.stats.count);
+        this.toolbarStatus.textContent = [
+          settings.enabled ? "弹幕开启" : "弹幕关闭",
+          match ? "已匹配" : "待匹配",
+          `${loaded} 条可见`,
+          session.statusLabel || "",
+        ]
+          .filter(Boolean)
+          .join(" · ");
+      }
+      this.syncControlStates();
+    }
+
+    updateImportState(importInfo = this.session.getBilibiliImportDebugState()) {
+      if (this.importStatus) {
+        this.importStatus.textContent = importInfo.message || "未导入";
+        this.importStatus.classList.toggle("is-error", importInfo.phase === "error");
+      }
+      this.renderImportSummary(importInfo);
+      if (
+        this.importInput &&
+        !normalizeSpace(this.importInput.value) &&
+        importInfo.records?.length === 1 &&
+        importInfo.record?.rawInput
+      ) {
+        this.importInput.value = importInfo.record.rawInput;
+      }
+      if (this.importApplyButton) {
+        this.importApplyButton.disabled = importInfo.phase === "loading" || importInfo.phase === "restoring";
+      }
+      if (this.importClearButton) {
+        this.importClearButton.disabled =
+          importInfo.phase === "loading" ||
+          importInfo.phase === "restoring" ||
+          !(safeNumber(importInfo.counts?.total, 0) || safeNumber(importInfo.sourceLoadedCount, 0));
+      }
+      return importInfo;
+    }
+
+    updatePanelState(importInfo = this.session.getBilibiliImportDebugState()) {
       if (!this.panelState) {
         return;
       }
       const session = this.session;
       const match = session.currentMatch;
       const settings = session.settings;
-      if (this.panelSubtitle) {
-        this.panelSubtitle.textContent = "外置工具条入口";
-      }
-      this.panelState.textContent = [session.statusLabel, match ? "已匹配" : "待匹配"].join("\n");
+      this.updateToolbarState();
       if (this.enabledInput) {
         this.enabledInput.checked = settings.enabled;
       }
       Object.entries(this.rangeInputs).forEach(([key, input]) => {
         this.syncInputValue(input, this.getDisplaySettingValue(key, settings));
       });
-      this.rowValues.enabled.textContent = settings.enabled ? "开" : "关";
+      if (this.rowValues.enabled) {
+        this.rowValues.enabled.textContent = settings.enabled ? "开" : "关";
+      }
       ["fontSize", "displayRegionRatio", "opacity", "speed", "offset"].forEach((key) => {
         this.updateSettingValueText(key, this.getDisplaySettingValue(key, settings));
       });
@@ -7012,35 +7800,15 @@
       }
       this.renderTokenList("blockedKeywords", this.keywordList);
       this.renderTokenList("blockedRegexes", this.regexList, session.invalidRegexes || []);
-      this.regexErrors.textContent = (session.invalidRegexes || []).length
-        ? `失效正则已跳过:\n${session.invalidRegexes
-            .map((entry) => `${entry.raw} -> ${entry.message}`)
-            .join("\n")}`
-        : "";
+      if (this.regexErrors) {
+        this.regexErrors.textContent = (session.invalidRegexes || []).length
+          ? `失效正则已跳过:\n${session.invalidRegexes
+              .map((entry) => `${entry.raw} -> ${entry.message}`)
+              .join("\n")}`
+          : "";
+      }
 
-      const importInfo = session.getBilibiliImportDebugState();
-      if (this.importStatus) {
-        this.importStatus.textContent = importInfo.message || "未导入";
-        this.importStatus.classList.toggle("is-error", importInfo.phase === "error");
-      }
-      this.renderImportSummary(importInfo);
-      if (
-        this.importInput &&
-        !normalizeSpace(this.importInput.value) &&
-        importInfo.records?.length === 1 &&
-        importInfo.record?.rawInput
-      ) {
-        this.importInput.value = importInfo.record.rawInput;
-      }
-      if (this.importApplyButton) {
-        this.importApplyButton.disabled = importInfo.phase === "loading" || importInfo.phase === "restoring";
-      }
-      if (this.importClearButton) {
-        this.importClearButton.disabled =
-          importInfo.phase === "loading" ||
-          importInfo.phase === "restoring" ||
-          !(safeNumber(importInfo.counts?.total, 0) || safeNumber(importInfo.sourceLoadedCount, 0));
-      }
+      this.updateImportState(importInfo);
 
       const context = session.resolvePageContext();
       const transportConfig = session.transport.getConfig();
@@ -7058,7 +7826,9 @@
         `正则规则: ${settings.blockedRegexes.length} 条`,
         (session.invalidRegexes || []).length ? `失效正则: ${(session.invalidRegexes || []).length} 条` : "失效正则: 0 条",
       ];
-      this.summaryStats.textContent = summaryLines.join("\n");
+      if (this.summaryStats) {
+        this.summaryStats.textContent = summaryLines.join("\n");
+      }
 
       const matchLines = [
         `当前路由: ${session.route.routeKey}`,
@@ -7071,8 +7841,21 @@
         `状态: ${session.statusMessage || "空闲"}`,
         `自定义 API: ${transportConfig.customApiPrefix || "未设置"}`,
       ];
-      this.matchStats.textContent = matchLines.join("\n");
-      this.syncControlStates();
+      if (this.matchStats) {
+        this.matchStats.textContent = matchLines.join("\n");
+      }
+    }
+
+    update() {
+      this.updateToolbarState();
+      const importPhase = this.session.bilibiliImport?.phase || "";
+      const shouldUpdateImport =
+        this.isImportPopoverOpen() || importPhase === "loading" || importPhase === "restoring" || importPhase === "error";
+      const importInfo = shouldUpdateImport ? this.updateImportState() : null;
+      if (!this.isPanelOpen()) {
+        return;
+      }
+      this.updatePanelState(importInfo || undefined);
     }
   }
 
@@ -7221,6 +8004,7 @@
         this.refreshVisibleComments({ clearOverlay: false });
         return;
       }
+      this.scheduler.updateDensityConfig();
       this.panel.update();
     }
 
@@ -7230,6 +8014,21 @@
       }
       const previousVideo = this.video;
       const isSameVideo = previousVideo === video;
+      const nextPlayerContainer = video.closest("section[player]") || video.parentElement || video;
+      const controlsReady =
+        !document.fullscreenElement &&
+        this.panel.toolbar?.isConnected &&
+        this.panel.panel?.isConnected &&
+        this.panel.importPopover?.isConnected &&
+        this.panel.matcher?.isConnected;
+      if (
+        isSameVideo &&
+        this.playerContainer === nextPlayerContainer &&
+        this.renderer.overlay?.isConnected &&
+        controlsReady
+      ) {
+        return;
+      }
       if (previousVideo && !isSameVideo) {
         this.detachVideoDensityListeners(previousVideo);
       }
@@ -7238,7 +8037,7 @@
         this.attachVideoDensityListeners(video);
       }
       const densityChanged = this.applyDensityDurationConstraints(null);
-      this.playerContainer = video.closest("section[player]") || video.parentElement || video;
+      this.playerContainer = nextPlayerContainer;
       if (isSameVideo) {
         this.skipPrompt.attach(this.playerContainer);
         this.panel.attach(this.playerContainer, this.renderer.overlay);
@@ -8005,12 +8804,6 @@
       };
     }
 
-    ensureBaseDanmakuLoaded() {
-      if (!this.currentMatch || !this.store.hasSource(DANDANPLAY_SOURCE_KEY)) {
-        throw new Error("请先等待当前页面弹幕加载完成");
-      }
-    }
-
     removeLoadedBilibiliImportSources(bindingKeys = []) {
       const targetBindingKeys = Array.isArray(bindingKeys)
         ? bindingKeys
@@ -8044,8 +8837,11 @@
       return restoreEntries;
     }
 
+    getCurrentDanmakuEpisodeId(fallback = null) {
+      return this.currentMatch?.episodeId ?? fallback ?? this.route.routeKey;
+    }
+
     async applyBilibiliImportRecord(record, token, options = {}) {
-      this.ensureBaseDanmakuLoaded();
       const mode = options.mode || "manual";
       const isDerivedRestore = mode === "restore-derived" || mode === "restore-series";
       const isRestore = mode !== "manual";
@@ -8098,7 +8894,7 @@
           cid: selectedPart.cid,
           duration: videoMeta.duration,
           partDuration: selectedPart.duration,
-          sessionEpisodeId: this.currentMatch?.episodeId ?? null,
+          sessionEpisodeId: this.getCurrentDanmakuEpisodeId(selectedPart.cid),
         },
         this
       );
@@ -8178,7 +8974,7 @@
       this.store.replaceSource(sourceKey, comments, {
         label: `B站 ${formatBilibiliImportLabel(mergedRecord)}`,
         source: "bilibili",
-        episodeId: this.currentMatch?.episodeId ?? null,
+        episodeId: this.getCurrentDanmakuEpisodeId(selectedPart.cid),
         rawInput: mergedRecord.rawInput,
         sourceType: mergedRecord.sourceType,
         bvid: mergedRecord.bvid,
@@ -8809,13 +9605,26 @@
     }
 
     observeDom() {
-      this.observer = new MutationObserver(() => {
+      this.observer = new MutationObserver((records) => {
+        if (records.length && records.every((record) => this.isRuntimeOnlyMutation(record))) {
+          return;
+        }
         this.scheduleEnsureSession();
       });
       this.observer.observe(document.documentElement, {
         subtree: true,
         childList: true,
       });
+    }
+
+    isRuntimeOnlyMutation(record) {
+      if (isRuntimeElementNode(record.target)) {
+        return true;
+      }
+      const changedElements = [...record.addedNodes, ...record.removedNodes].filter(
+        (node) => node?.nodeType === 1
+      );
+      return changedElements.length > 0 && changedElements.every((node) => isRuntimeElementNode(node));
     }
 
     scheduleEnsureSession(force = false) {

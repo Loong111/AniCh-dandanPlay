@@ -2,7 +2,7 @@
 
 > **Task**: Deliver and maintain an AniCh-specific Dandanplay danmaku userscript.
 > **Started**: 2026-04-19
-> **Last Updated**: 2026-05-03
+> **Last Updated**: 2026-05-04
 
 ## References
 - [Project Overview](../analysis/project-overview.md)
@@ -36,17 +36,14 @@
 
 ## Current Status
 **Active Phase**: Phase 7 — Similar Danmaku Merge
-**Active Task**: Task 7.3 — live playback verification for similar danmaku merge controls and counted rendering
-**Blockers**: Live AniCh/userscript-manager verification remains user-owned; Phase 6 live multi-import verification is still pending
+**Active Task**: Task 7.3 — remaining live verification for similar danmaku merge controls and counted rendering
+**Blockers**: Phase 6 live multi-import verification is still pending; no-loss performance optimization is complete as of v2.7.11
 
 ## Next Steps
-1. Verify v2.7.0 control UI on live AniCh playback: the Apple-inspired frosted toolbar, settings panel, Bilibili import popover, matcher, switches, sliders, and skip prompt should remain readable, clickable, draggable, and responsive outside browser fullscreen.
-2. Verify v2.6.9 SkipCue on live AniCh playback: the prompt should appear and click-to-seek should work in normal view and browser fullscreen, including when `偏移` is non-zero.
-3. Verify v2.6.9 on the high-danmaku episode and confirm `最大加载` defaults to `10000` and no longer changes when `同刻发送` changes.
-4. Confirm `同刻发送` only shaves dense one-second buckets while sparse segments keep all comments.
-5. Confirm Bilibili imports use cross-source `0.2s` fuzzy dedupe for overlapping sources, and compare source bucket raw/accepted/deduped counts with `已加载` and merge input counts.
-6. Toggle `合并优先` and confirm max-load plus same-moment drops preserve merged counted comments before unmerged single comments.
-7. Re-run Phase 6 multi-import live checks when needed, including Bilibili bangumi `ss` links such as `https://www.bilibili.com/bangumi/play/ss4145`, because that manual verification remains pending.
+1. Treat the no-loss performance optimization track as complete: user verified macOS Chrome page CPU at about 15 without the script, about 20 with the script loaded, and a window/fullscreen switch spike to about 50 for roughly 5 seconds before returning to about 20.
+2. Do not continue the deferred cached video lookup optimization unless a new live performance regression appears or the user explicitly asks for it.
+3. Re-run Phase 6 multi-import live checks when needed, including Bilibili bangumi `ss` links such as `https://www.bilibili.com/bangumi/play/ss4145`, because that manual verification remains pending.
+4. If similar-merge counted playback is actively used, verify threshold/min-count/gap/span/max-emit/max-load controls, filters-before-counts behavior, seek/offset/fullscreen stability, and SkipCue original-comment input.
 
 ## Session Log
 | Date | Session | Summary |
@@ -80,3 +77,13 @@
 | 2026-05-02 | 27 | Added v2.6.9 SkipCue hotfix: restored fullscreen skip prompt visibility, made click-to-seek offset-aware, refreshed the scheduler after jumps, and validated syntax, diff whitespace, plus a local SkipCue/CSS probe |
 | 2026-05-02 | 28 | Added v2.7.0 Apple-inspired control UI refresh with frosted external toolbar, 44px circular action buttons, light settings/import/matcher panels, refined switch/range controls, press-scale micro-interactions, responsive layout rules, and local static/CSS validation |
 | 2026-05-03 | 29 | Added v2.7.1 Bilibili bangumi `ss` import support: `ss` season links parse to `season_id`, use the current AniCh episode number as the PGC episode number, reuse existing PGC season metadata and chain derivation, update docs, and keep live AniCh verification user-owned |
+| 2026-05-04 | 30 | Added v2.7.3 no-loss scheduler CPU optimization after live Chrome data showed script-on baseline CPU stayed high even with zero/currently disabled danmaku: cached density config outside the hot path, replaced continuous playback RAF polling with timer-based next-danmaku/SkipCue wakeups, stopped timers while paused/disabled/no-work, restored scheduling through video play/seek/ratechange events, and validated syntax, diff whitespace, static hot-path checks, and a Scheduler timer lifecycle probe |
+| 2026-05-04 | 31 | Planned no-loss performance work in two batches and implemented batch 1 as v2.7.4: ignore runtime-only DOM mutations, short-circuit stable same-video rebinding, cache repeated text width measurement, and delegate animationend cleanup at the renderer layer; batch 2 remains deferred until user live verification passes |
+| 2026-05-04 | 32 | Added v2.7.5 cross-source dedupe correction after live multi-source playback showed widespread `x2` counted comments: fuzzy keys now use normalized text, later sources estimate a stable dedupe-only timing offset with one vote per normalized text, source summaries expose offset alignment, and local harness checks cover shifted cross-source duplicates, same-source repeats, small-evidence no-offset behavior, and repeated-common-text no-offset behavior |
+| 2026-05-04 | 33 | User verified the v2.7.5 correction and approved continuing no-loss performance items 4/5; v2.7.6 adds renderer batch DOM insertion via `emitMany()` and skips ResizeObserver clear/refresh work when player size is unchanged, with syntax, diff whitespace, static hot-path checks, and a local Renderer/resize harness passing |
+| 2026-05-04 | 34 | Added v2.7.7 skip-cue keyword aliases for `空降`, `跳伞`, `指路`, `传送`, and `跳转`; the cue parser now records the matched keyword, prompt eyebrow reflects it, and local parsing probes verify aliases, invalid-first fallback, lead-time filtering, and legacy `空降` behavior |
+| 2026-05-04 | 35 | Added v2.7.8 no-loss performance item 6 and an AniCh-integrated control layout: closed-panel updates now skip heavy panel subtree refreshes, while the control bar is inserted between `player-wrap` and `player-info` with inline settings expansion and retained Bilibili import hover behavior |
+| 2026-05-04 | 36 | Added v2.7.9 control-click hotfix after the integrated dock could overlap AniCh's desktop episode column: dock width now follows the player column on wide layouts, returns to full width below 70rem, and raises/preserves pointer handling for toolbar action buttons |
+| 2026-05-04 | 37 | Added v2.7.10 import-popover direction refinement: the page-integrated Bilibili import popover now opens upward from the control dock with a bottom-right transform origin while preserving the existing hover lifecycle and import UI behavior |
+| 2026-05-04 | 38 | Added v2.7.11 import-popover stacking fix: the page-integrated control dock now sits above the custom danmaku overlay stacking level so the upward Bilibili import popover is not visually covered by active danmaku |
+| 2026-05-04 | 39 | User completed live macOS Chrome performance verification: page CPU is about 15 with no script, about 20 with the script loaded, and window/fullscreen switching spikes to about 50 for roughly 5 seconds before returning to about 20; the no-loss performance optimization track is considered complete and cached video lookup remains unnecessary unless requested later |

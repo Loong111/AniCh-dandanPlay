@@ -147,7 +147,7 @@ densityLimit: {
 - Very large merged lists can still be expensive to schedule. Mitigate with `maxScheduledComments`, which remains a global cap after local one-second density caps have been applied.
 - Local-density peak shaving applies `maxEmitPerFrame` per one-second candidate-comment bucket: dense seconds are capped while sparse seconds pass through intact. `maxScheduledComments` is independent and only acts as a final global cap.
 - The optional `合并优先` mode treats merged display comments as higher priority during density drops, preserving counted comments before unmerged single comments.
-- Source-level overlap between built-in proxy and Bilibili import is handled before filtering/merge: exact duplicates are removed by fingerprint, and later source buckets also use a same-text/type `0.2s` fuzzy duplicate window. Source summaries expose raw, accepted, and deduped counts when drops occur.
+- Source-level overlap between built-in proxy and Bilibili import is handled before filtering/merge: exact duplicates are removed by fingerprint, and later source buckets use a normalized same-text/type `0.2s` fuzzy duplicate window. If enough overlapping comments reveal a stable source timing offset, the offset is applied only during dedupe matching and source summaries expose raw, accepted, deduped, and offset counts when drops occur.
 - Merging after filters means filtered comments do not contribute to counts. This is the recommended behavior because the count should represent visible comments.
 
 ## Confirmed Defaults

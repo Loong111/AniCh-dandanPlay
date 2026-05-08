@@ -84,6 +84,7 @@ Before marking any task as complete, verify ALL of the following:
   - `triggerTime`
   - `targetTime`
   - `targetLabel`
+  - `keyword`
   - `sourceText`
 - Do not let the renderer read protobuf- or source-specific fields.
 - Route/session invalidation is mandatory. Every network response must be checked against the active session token before merge.
@@ -97,7 +98,7 @@ Before marking any task as complete, verify ALL of the following:
 ### Violation Hotspots To Fix
 - `anich-danmaku-fix.user.js` still concentrates runtime boundaries inside one large file, so review cost remains high.
 - AniCh title selectors, route signals, player container rebinding, and fullscreen host selection still depend on site DOM conventions.
-- `SkipCue` parsing is heuristic and depends on user-authored `空降` timestamp formats, so final playback verification remains manual.
+- `SkipCue` parsing is heuristic and depends on user-authored skip keywords such as `空降` / `跳伞` plus timestamp formats, so final playback verification remains manual.
 - Bilibili import now depends on userscript grant mode and cross-origin request boundaries, so page-window access and transport responsibilities must stay isolated.
 - Cross-episode Bilibili import now needs route-scoped multi-binding caches plus multiple season-scoped BV/page-offset chains, so binding identity, chain restore precedence, and per-chain clear semantics must remain centralized inside `Session`.
 
@@ -116,7 +117,7 @@ Before marking any task as complete, verify ALL of the following:
 - Keep the Dandanplay comment payload normalized before it reaches store, scheduler, renderer, or skip-cue logic.
 - Keep imported Bilibili comments normalized into the same `NormalizedDanmaku` contract before they enter `DanmakuStore`.
 - Preserve one source bucket per imported Bilibili binding using stable keys such as `import:bilibili:<bindingKey>`; refreshing the same binding updates that bucket in place, while different bindings may coexist and merge.
-- Preserve cross-source duplicate suppression before filtering and merging: exact fingerprints always dedupe, and later source buckets use a same-text/type `0.2s` fuzzy duplicate window against earlier accepted source comments.
+- Preserve cross-source duplicate suppression before filtering and merging: exact fingerprints always dedupe, later source buckets use a normalized same-text/type `0.2s` fuzzy duplicate window against earlier accepted source comments, and stable source-level timing offsets may be estimated for dedupe matching only without changing displayed comment times.
 - Preserve route-scoped Bilibili import collections and season-scoped chain collections separately; restore precedence applies per chain as `explicit route binding > derived route binding > live chain derivation`, and all matching chains merge on the target AniCh episode unless the user explicitly asks for a priority model.
 - Bilibili PGC bangumi `ep`/`ss` links must resolve through `pgc/view/web/season` and derive by `season_id + episode number offset`, not raw `ep_id + n`, because official Bilibili `ep_id` values may stop being consecutive mid-season.
 - Bilibili PGC bangumi `ss` links do not carry a concrete episode id; manual imports must use the current AniCh episode number as the Bilibili season episode number before resolving metadata.
